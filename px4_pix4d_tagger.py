@@ -963,7 +963,9 @@ def process(args: argparse.Namespace) -> int:
             _check_cancelled(args)
             total = len(matches)
             relative_path = match.image.relative_path or Path(match.image.path.name)
-            image_name = str(relative_path)
+            # Use forward slashes in logs/reports on every platform so audit
+            # files compare cleanly between Windows and POSIX systems.
+            image_name = relative_path.as_posix()
             _notify_progress(args, number, total, image_name, "Copying and tagging image…")
             print(f"[{number:04d}/{total:04d}] {image_name}")
             print(f"  Capture sequence: {match.capture.sequence} (result {match.capture.result})")
@@ -1002,7 +1004,7 @@ def process(args: argparse.Namespace) -> int:
             source_sha256 = hashlib.sha256(source).hexdigest()
             report_rows.append(
                 {
-                    "image": str(relative_path),
+                    "image": relative_path.as_posix(),
                     "source_bytes": len(source),
                     "source_sha256": source_sha256,
                     "capture_sequence": match.capture.sequence,
