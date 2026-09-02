@@ -147,7 +147,7 @@ def test_body_quaternion_interpolation_midpoint_uses_shortest_rotation():
     q0 = (1.0, 0.0, 0.0, 0.0)
     x, y, z, w = Rotation.from_euler("Z", 90, degrees=True).as_quat()
     q1 = (w, x, y, z)
-    got = tagger.interpolate_body_quaternion([10.0, 12.0], [q0, q1], 11.0)
+    got = tagger.interpolate_body_quaternion([10.0, 10.2], [q0, q1], 10.1)
     rotation = Rotation.from_quat([got[1], got[2], got[3], got[0]])
     assert rotation.as_euler("ZYX", degrees=True)[0] == pytest.approx(45.0, abs=1e-8)
 
@@ -277,7 +277,7 @@ def test_existing_non_pix4d_xmp_content_survives_retag():
     existing = etree.tostring(root, xml_declaration=False, encoding="UTF-8")
     event = capture(yaw=22)
     rebuilt = tagger.build_xmp(existing, event, (22, 1, 2))
-    parsed = etree.fromstring(rebuilt)
+    parsed = etree.fromstring(rebuilt[len(tagger.XMP_HEADER) :])
     description = parsed.xpath("//*[local-name()='Description']")[0]
     assert description.get("CreatorTool") == "synthetic-test"
 
