@@ -669,6 +669,46 @@ def _notify_progress(
         callback(current, total, image_name, stage)
 
 
+def save_conversion_log(
+    output_dir: Path,
+    lines: Sequence[str],
+    app_version: str,
+    result: str,
+    created_at: datetime | None = None,
+) -> Path:
+    """Atomically save a unique, human-readable conversion session log."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = created_at or datetime.now()
+    stem = f"conversion_log_{timestamp:%Y%m%d_%H%M%S}"
+    destination = output_dir / f"{stem}.txt"
+    counter = 2
+    while destination.exists():
+        destination = output_dir / f"{stem}_{counter}.txt"
+        counter += 1
+    body = "\n".join(
+        [
+            "PX4 → Pix4D JPEG Tagger — Conversion Log",
+            f"Software version: {app_version}",
+            f"Session started: {timestamp.astimezone().isoformat(timespec='seconds')}",
+            f"Final result: {result}",
+            "",
+            *[str(line).rstrip("\n") for line in lines],
+            "",
+        ]
+    )
+    fd, temporary = tempfile.mkstemp(prefix=f".{destination.name}.", dir=output_dir)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as stream:
+            stream.write(body)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, destination)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+    return destination
+
+
 def process(args: argparse.Namespace) -> int:
     log_path = args.log.resolve()
     image_dir = args.images.resolve()

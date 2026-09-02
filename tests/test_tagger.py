@@ -2,6 +2,7 @@ from dataclasses import replace
 from io import BytesIO
 from pathlib import Path
 from argparse import Namespace
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import numpy as np
@@ -362,3 +363,35 @@ def test_end_to_end_writes_copy_and_report(tmp_path, monkeypatch):
         event,
         tagger.pix4d_ypr(event.quaternion_wxyz),
     )
+
+
+def test_conversion_log_contains_version_result_and_visible_lines(tmp_path):
+    started = datetime(2026, 9, 2, 12, 34, 56, tzinfo=timezone.utc)
+    path = tagger.save_conversion_log(
+        tmp_path,
+        ["12:34:56  Flight log: flight.ulg", "12:35:01  FINAL RESULT: SUCCESS"],
+        "Verification build 0.4.1",
+        "SUCCESS — all output images verified",
+        created_at=started,
+    )
+    assert path.name == "conversion_log_20260902_123456.txt"
+    text = path.read_text(encoding="utf-8")
+    assert "Software version: Verification build 0.4.1" in text
+    assert "Final result: SUCCESS — all output images verified" in text
+    assert "Flight log: flight.ulg" in text
+    assert "FINAL RESULT: SUCCESS" in text
+
+
+def test_conversion_log_never_overwrites_an_existing_log(tmp_path):
+    started = datetime(2026, 9, 2, 12, 34, 56, tzinfo=timezone.utc)
+    first = tagger.save_conversion_log(tmp_path, ["first"], "0.4.1", "SUCCESS", started)
+    second = tagger.save_conversion_log(tmp_path, ["second"], "0.4.1", "FAILED", started)
+    assert first.name == "conversion_log_20260902_123456.txt"
+    assert second.name == "conversion_log_20260902_123456_2.txt"
+    assert "first" in first.read_text(encoding="utf-8")
+    assert "second" in second.read_text(encoding="utf-8")
+
+
+def test_conversion_log_leaves_no_temporary_file(tmp_path):
+    tagger.save_conversion_log(tmp_path, ["complete"], "0.4.1", "SUCCESS")
+    assert not [path for path in tmp_path.iterdir() if path.name.startswith(".conversion_log_")]

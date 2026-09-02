@@ -22,7 +22,7 @@ import px4_pix4d_tagger as engine
 
 
 APP_TITLE = "PX4 → Pix4D Image Tagger"
-APP_VERSION = "Verification build 0.4"
+APP_VERSION = "Verification build 0.4.1"
 
 # GitHub-dark-inspired palette. These are explicit rather than OS theme colors
 # so the student interface is consistent on Windows, macOS, and Linux.
@@ -124,6 +124,8 @@ class TaggerApp:
         self.config = load_course_config()
         self.messages: queue.Queue = queue.Queue()
         self.worker: threading.Thread | None = None
+        self.session_log_lines: list[str] = []
+        self.session_started: datetime | None = None
         self._progress_is_determinate = False
 
         self.log_var = StringVar()
@@ -508,6 +510,7 @@ class TaggerApp:
 
     def _append_log(self, timestamp: str, text: str, stream_kind: str = "stdout") -> None:
         tag = self._classify_log(text, stream_kind)
+        self.session_log_lines.append(f"{timestamp}  {text}")
         self.log_text.configure(state="normal")
         self.log_text.insert(END, f"{timestamp}  ", "time")
         self.log_text.insert(END, text + "\n", tag)
@@ -551,6 +554,17 @@ class TaggerApp:
         self.log_text.configure(state="normal")
         self.log_text.delete("1.0", END)
         self.log_text.configure(state="disabled")
+        self.session_log_lines = []
+        self.session_started = datetime.now().astimezone()
+        self._append_manual(f"{APP_TITLE} — {APP_VERSION}")
+        self._append_manual(f"Flight log: {log}")
+        self._append_manual(f"Original JPEG folder: {images}")
+        self._append_manual(f"Tagged output folder: {output}")
+        self._append_manual(
+            "Orientation: "
+            f"source={attitude_source}; facing={camera_facing:g}°; "
+            f"down={camera_down_angle:g}°; image rotation={image_rotation:g}°"
+        )
         self.status_var.set("Starting image-tagging session…")
         self.progress_detail_var.set(f"Preparing {jpeg_count} images")
         self.status_dot.configure(fg=BLUE_HOVER)
@@ -625,7 +639,12 @@ class TaggerApp:
                     self.status_dot.configure(fg="#3fb950")
                     self.status_var.set("Complete — every tagged copy passed verification.")
                     self.progress_detail_var.set("Ready for Pix4Dmapper")
-                    messagebox.showinfo(APP_TITLE, f"Pix4D-ready copies are complete.\n\n{message[2]}")
+                    self._append_manual("FINAL RESULT: SUCCESS — every tagged copy passed verification.")
+                    log_path = self._save_session_log(Path(message[2]), "SUCCESS — all output images verified")
+                    messagebox.showinfo(
+                        APP_TITLE,
+                        f"Pix4D-ready copies are complete.\n\n{message[2]}\n\nConversion log:\n{log_path}",
+                    )
                 elif kind == "error":
                     self.progress.stop()
                     self.run_button.configure(state="normal")
@@ -634,10 +653,46 @@ class TaggerApp:
                     self.progress_detail_var.set("No complete output set was produced")
                     for line in message[2].splitlines():
                         self._append_log(datetime.now().strftime("%H:%M:%S"), line, "stderr")
-                    messagebox.showerror(APP_TITLE, message[1])
+                    self._append_manual(f"FINAL RESULT: FAILED — {message[1]}")
+                    log_path = self._save_session_log(
+                        Path(self.output_var.get().strip()), f"FAILED — {message[1]}"
+                    )
+                    messagebox.showerror(APP_TITLE, f"{message[1]}\n\nConversion log:\n{log_path}")
         except queue.Empty:
             pass
         self.root.after(100, self._poll_messages)
+
+    def _save_session_log(self, requested_output: Path, result: str) -> Path:
+        target = requested_output
+        try:
+            source = Path(self.images_var.get().strip()).resolve()
+            resolved = requested_output.resolve()
+            if resolved == source or source in resolved.parents:
+                target = requested_output.parent
+        except (OSError, RuntimeError):
+            pass
+        try:
+            return engine.save_conversion_log(
+                target,
+                self.session_log_lines,
+                APP_VERSION,
+                result,
+                created_at=self.session_started,
+            )
+        except OSError as exc:
+            fallback = Path(self.log_var.get().strip()).parent
+            self._append_log(
+                datetime.now().strftime("%H:%M:%S"),
+                f"WARNING: Could not save conversion log in {target}: {exc}. Using {fallback}.",
+                "stderr",
+            )
+            return engine.save_conversion_log(
+                fallback,
+                self.session_log_lines,
+                APP_VERSION,
+                result,
+                created_at=self.session_started,
+            )
 
     def _open_output(self) -> None:
         path = Path(self.output_var.get().strip())
