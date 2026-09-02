@@ -4,51 +4,52 @@ A desktop tool that copies Sony RX0 II JPEG photographs, matches them to PX4
 `.ulg` camera-capture records, and writes the GPS and camera orientation metadata
 needed by Pix4Dmapper.
 
-> **Windows students: start with the instructions immediately below.**
-> Do not download the Python files one at a time, and do not run the build script.
+> **Windows students: download the Windows application below.**
+> You do not need Python, an IDE, or an internet connection to run it.
 
-## Windows student installation
+## Windows student download
 
-### 1. Install Python first
+### 1. Download the application
 
-1. Open the official [Python downloads page for Windows](https://www.python.org/downloads/windows/).
-2. Download the **latest stable 64-bit Python 3 release**. Python **3.11 or newer**
-   is required.
-3. Run the Python installer and complete the installation.
-4. If the installer offers **Add Python to PATH**, enable it.
-5. Restart the computer if the installer requests it.
+[**Download the latest Windows version**](https://github.com/inventix/Pix4DMapper_Image_Geotagger_For_PX4/releases/latest/download/PX4_Pix4D_Tagger_Windows.zip)
 
-You install Python only once. You do not need to install this program's Python
-packages manually; the launcher handles them on first use.
+The download contains:
 
-### 2. Download the complete geotagger
+- `PX4_Pix4D_Tagger.exe` — the complete Windows application.
+- `course_config.json` — the instructor-controlled course settings.
 
-1. Click [Download the latest geotagger ZIP](https://github.com/inventix/Pix4DMapper_Image_Geotagger_For_PX4/archive/refs/heads/main.zip).
-2. Open the downloaded ZIP file.
-3. Click **Extract All** and choose a normal writable location such as
-   `Documents\PX4_Pix4D_Geotagger`.
+### 2. Extract the download
+
+1. Open `PX4_Pix4D_Tagger_Windows.zip`.
+2. Click **Extract All**.
+3. Choose a normal location such as `Documents\PX4 Pix4D Tagger`.
 4. Open the extracted folder.
 
-**Do not run the program from inside the ZIP file.** It must be extracted first
-because the launcher creates a private program environment in that folder.
+Do not run the application from inside the ZIP file. Keep
+`course_config.json` in the same folder as the EXE.
 
-### 3. Start the program
+### 3. Run the application
 
-Double-click:
+Double-click `PX4_Pix4D_Tagger.exe`.
 
-`Launch_PX4_Pix4D_Tagger.bat`
+The program runs entirely on the Windows computer. It does not upload flight
+logs or photographs, and it does not require Python or internet access after
+the ZIP has been downloaded.
 
-On the first launch, Windows opens a setup window while the launcher:
+The published application is a self-contained 64-bit build for supported
+64-bit Windows 10 and Windows 11 computers. Windows may show a Microsoft
+Defender SmartScreen warning because this open-source build is not yet
+commercially code-signed. Confirm that the file came from this repository
+before choosing **More info → Run anyway**.
 
-1. Finds Python 3.11 or newer.
-2. Creates a private `.venv` environment inside the geotagger folder.
-3. Downloads and installs the required components.
-4. Opens the graphical geotagger.
+## Build status and source code
 
-The first launch requires internet access and may take several minutes. Later
-launches normally open directly. If Windows displays a security prompt for the
-downloaded batch file, confirm that it came from this repository before allowing
-it to run.
+Every Windows release is built from the public source code by GitHub Actions.
+The automated test suite must pass before the versioned release is published.
+
+Developers can inspect or download the complete source from this repository.
+Python 3.11 or newer is required only to run or build from source; ordinary
+Windows students should use the released EXE above.
 
 ## Tag one flight
 
@@ -95,10 +96,10 @@ and run `Launch_PX4_Pix4D_Tagger.bat` there.
 In the extracted folder, select the file named
 **Launch_PX4_Pix4D_Tagger** whose Type is **Windows Batch File**.
 
-## Instructor: no-Python lab deployment
+## Instructor and developer build from source
 
-For the simplest classroom experience, an instructor or IT technician can build
-a standalone Windows application once:
+Ordinary students should use the published EXE. To reproduce the Windows build
+from the open-source code, an instructor or developer can build it locally:
 
 1. Use a Windows computer with Python 3.11 or newer installed.
 2. Download and extract the complete repository.
