@@ -8,6 +8,7 @@ import os
 import queue
 import subprocess
 import sys
+import tempfile
 import threading
 import traceback
 from argparse import Namespace
@@ -22,7 +23,7 @@ import px4_pix4d_tagger as engine
 
 
 APP_TITLE = "PX4 → Pix4D Image Tagger"
-APP_VERSION = "Verification build 0.4.1"
+APP_VERSION = "Development build for v0.5.0"
 
 # GitHub-dark-inspired palette. These are explicit rather than OS theme colors
 # so the student interface is consistent on Windows, macOS, and Linux.
@@ -53,6 +54,11 @@ ATTITUDE_SOURCE_CHOICES = {
     "Aircraft body — fixed camera (recommended)": "body",
     "Logged camera/gimbal — use camera_capture.q": "camera_capture",
 }
+MATCHING_CHOICES = {
+    "Automatic — timestamps preferred (recommended)": "auto",
+    "Timestamps only — require usable EXIF times": "time",
+    "Capture order — image and trigger counts must match": "order",
+}
 LAYOUT_CHOICES = {
     "Landscape — top edge toward camera facing": 0.0,
     "Portrait clockwise — top edge toward camera right": 90.0,
@@ -78,6 +84,7 @@ def load_course_config() -> dict:
         "camera_down_angle_deg": 90.0,
         "image_rotation_deg": 0.0,
         "attitude_source": "body",
+        "recursive_images": False,
     }
     path = application_directory() / "course_config.json"
     if not path.exists():
@@ -124,6 +131,8 @@ class TaggerApp:
         self.config = load_course_config()
         self.messages: queue.Queue = queue.Queue()
         self.worker: threading.Thread | None = None
+        self.cancel_event = threading.Event()
+        self.close_after_worker = False
         self.session_log_lines: list[str] = []
         self.session_started: datetime | None = None
         self._progress_is_determinate = False
@@ -132,6 +141,12 @@ class TaggerApp:
         self.images_var = StringVar()
         self.output_var = StringVar()
         self.overwrite_var = BooleanVar(value=False)
+        self.recursive_var = BooleanVar(value=bool(self.config["recursive_images"]))
+        match_name = next(
+            (name for name, value in MATCHING_CHOICES.items() if value == self.config["match_method"]),
+            next(iter(MATCHING_CHOICES)),
+        )
+        self.match_method_var = StringVar(value=match_name)
         source_name = next(
             (name for name, value in ATTITUDE_SOURCE_CHOICES.items() if value == self.config["attitude_source"]),
             next(iter(ATTITUDE_SOURCE_CHOICES)),
@@ -146,6 +161,7 @@ class TaggerApp:
         self.status_var = StringVar(value="Ready — select one flight log and its original-image folder.")
         self.progress_detail_var = StringVar(value="Waiting for a flight dataset")
         self._build()
+        self.root.protocol("WM_DELETE_WINDOW", self._close_window)
         self.root.after(100, self._poll_messages)
 
     def _build(self) -> None:
@@ -179,7 +195,7 @@ class TaggerApp:
         Label(
             outer,
             text=(
-                "Match original Sony JPEGs to a PX4 flight log, then write verified GPS and "
+                "Match camera JPEGs to a PX4 flight log, then write verified GPS and "
                 "rigid-camera orientation metadata into new copies. Source images remain untouched."
             ),
             bg=BG,
@@ -200,7 +216,7 @@ class TaggerApp:
         setup_border.pack(fill=X)
         Label(setup, text="FLIGHT DATA", bg=SURFACE, fg=MUTED, font=("Helvetica Neue", 9, "bold")).pack(anchor="w")
         self._path_row(setup, "1  PX4 flight log", ".ulg flight record", self.log_var, self._browse_log)
-        self._path_row(setup, "2  Original JPEG folder", "Sony camera originals", self.images_var, self._browse_images)
+        self._path_row(setup, "2  Original JPEG folder", "Camera originals", self.images_var, self._browse_images)
         self._path_row(setup, "3  Tagged output folder", "New Pix4D-ready copies", self.output_var, self._browse_output)
 
         options = Frame(setup, bg=SURFACE)
@@ -217,6 +233,25 @@ class TaggerApp:
             font=("Helvetica Neue", 10),
             highlightthickness=0,
         ).pack(anchor="w")
+        Checkbutton(
+            options,
+            text="Include JPEGs in subfolders (folder structure is preserved)",
+            variable=self.recursive_var,
+            bg=SURFACE,
+            fg=MUTED,
+            activebackground=SURFACE,
+            activeforeground=TEXT,
+            selectcolor=INPUT_BG,
+            font=("Helvetica Neue", 10),
+            highlightthickness=0,
+        ).pack(anchor="w", pady=(4, 0))
+        self._orientation_combo(
+            setup,
+            "Image matching",
+            "Automatic is safest for most flights",
+            self.match_method_var,
+            tuple(MATCHING_CHOICES),
+        )
 
         orientation_border, orientation = self._card(orientation_tab)
         orientation_border.pack(fill=X)
@@ -295,6 +330,11 @@ class TaggerApp:
         self.open_button = self._button(action_row, "Open Output Folder", self._open_output)
         self.open_button.pack(side=LEFT, padx=(10, 0))
         self.open_button.configure(state="disabled")
+        self.cancel_button = self._button(action_row, "Cancel", self._cancel)
+        self.cancel_button.pack(side=LEFT, padx=(10, 0))
+        self.cancel_button.configure(state="disabled")
+        self.help_button = self._button(action_row, "Troubleshooting", self._show_troubleshooting)
+        self.help_button.pack(side=RIGHT)
 
         progress_border, progress_card = self._card(outer, padding=14)
         progress_border.pack(fill=X, pady=(0, 14))
@@ -471,7 +511,7 @@ class TaggerApp:
             self._suggest_output()
 
     def _browse_images(self) -> None:
-        selected = filedialog.askdirectory(title="Select folder containing original Sony JPEGs")
+        selected = filedialog.askdirectory(title="Select folder containing original camera JPEGs")
         if selected:
             self.images_var.set(selected)
             self._append_manual(f"Selected original-image folder: {selected}")
@@ -491,6 +531,43 @@ class TaggerApp:
         suggested = source.parent / f"Pix4D_Tagged_{suffix}"
         self.output_var.set(str(suggested))
         self._append_manual(f"Suggested output folder: {suggested}")
+
+    def _show_troubleshooting(self) -> None:
+        messagebox.showinfo(
+            f"{APP_TITLE} — Troubleshooting",
+            "Before processing:\n"
+            "• Use the .ulg log and photos from one flight only.\n"
+            "• RAW, TIFF, PNG, HEIC, and other formats must be exported to JPEG first.\n"
+            "• The ULog must contain camera_capture. Aircraft-body orientation also requires "
+            "vehicle_attitude around each exposure.\n"
+            "• Automatic matching uses EXIF timestamps first and uses capture order only when "
+            "the counts make that unambiguous.\n"
+            "• If writing fails, choose a local output folder with enough free space and write permission.\n\n"
+            "The original images are never modified. A conversion log is saved after success, "
+            "failure, or cancellation.",
+        )
+
+    def _cancel(self) -> None:
+        if not self.worker or not self.worker.is_alive():
+            return
+        self.cancel_event.set()
+        self.cancel_button.configure(state="disabled")
+        self.status_dot.configure(fg=YELLOW)
+        self.status_var.set("Cancelling safely after the current operation…")
+        self.progress_detail_var.set("Staged files will be removed")
+        self._append_manual("Cancellation requested by user.")
+
+    def _close_window(self) -> None:
+        if self.worker and self.worker.is_alive():
+            if not messagebox.askyesno(
+                APP_TITLE,
+                "A conversion is still running. Cancel it and close after temporary files are cleaned up?",
+            ):
+                return
+            self.close_after_worker = True
+            self._cancel()
+            return
+        self.root.destroy()
 
     def _classify_log(self, text: str, stream_kind: str) -> str:
         upper = text.upper()
@@ -537,17 +614,65 @@ class TaggerApp:
             return
         output = Path(output_text)
         try:
+            resolved_images = images.resolve()
+            resolved_output = output.resolve()
+            if resolved_output == resolved_images or resolved_images in resolved_output.parents:
+                messagebox.showerror(
+                    APP_TITLE,
+                    "The output folder cannot be the original-image folder or a folder inside it.",
+                )
+                return
+        except OSError:
+            pass
+        try:
             attitude_source, camera_facing, camera_down_angle, image_rotation = self._orientation_values()
         except (ValueError, KeyError) as exc:
             messagebox.showerror(APP_TITLE, str(exc))
             return
-        jpeg_count = sum(1 for p in images.iterdir() if p.is_file() and p.suffix.lower() in {".jpg", ".jpeg"})
-        if jpeg_count == 0:
-            messagebox.showerror(APP_TITLE, "The original-image folder contains no JPEG files.")
+        try:
+            inventory = engine.inventory_images(images, recursive=bool(self.recursive_var.get()))
+        except engine.TaggerError as exc:
+            messagebox.showerror(APP_TITLE, str(exc))
             return
+        jpeg_count = len(inventory.jpeg_paths)
+        if jpeg_count == 0:
+            found = []
+            if inventory.raw_paths:
+                found.append(f"{len(inventory.raw_paths)} RAW")
+            if inventory.other_image_paths:
+                found.append(f"{len(inventory.other_image_paths)} other image")
+            detail = f" Found {' and '.join(found)} file(s)." if found else ""
+            messagebox.showerror(
+                APP_TITLE,
+                "The selected folder contains no supported JPEG files."
+                f"{detail}\n\nExport RAW or other image formats to JPEG first.",
+            )
+            return
+        match_method = MATCHING_CHOICES.get(self.match_method_var.get())
+        if match_method is None:
+            messagebox.showerror(APP_TITLE, "Select a valid image-matching method.")
+            return
+        warnings = []
+        if inventory.raw_paths:
+            warnings.append(f"{len(inventory.raw_paths)} RAW file(s) will be ignored")
+        if inventory.other_image_paths:
+            warnings.append(f"{len(inventory.other_image_paths)} other image file(s) will be ignored")
+        if inventory.ignored_file_count:
+            warnings.append(f"{inventory.ignored_file_count} non-image file(s) will be ignored")
+        warning_text = "\n\nWarnings:\n• " + "\n• ".join(warnings) if warnings else ""
+        nested_text = (
+            f" ({inventory.nested_jpeg_count} in subfolders)" if inventory.nested_jpeg_count else ""
+        )
         if not messagebox.askokcancel(
             APP_TITLE,
-            f"Process {jpeg_count} JPEGs from this flight?\n\nOriginals:\n{images}\n\nTagged copies:\n{output}",
+            f"Preflight found {jpeg_count} JPEG(s){nested_text}, "
+            f"{inventory.total_jpeg_bytes / 1_048_576:.1f} MB.\n\n"
+            f"Matching: {self.match_method_var.get()}\n"
+            f"Orientation: {self.attitude_source_var.get()}\n"
+            f"Mount: facing {camera_facing:g}°, down {camera_down_angle:g}°, "
+            f"image rotation {image_rotation:g}°\n\n"
+            f"Originals:\n{images}\n\nTagged copies:\n{output}"
+            f"{warning_text}\n\nContinue?",
         ):
             return
 
@@ -561,6 +686,15 @@ class TaggerApp:
         self._append_manual(f"Original JPEG folder: {images}")
         self._append_manual(f"Tagged output folder: {output}")
         self._append_manual(
+            f"Preflight inventory: {jpeg_count} JPEG; {len(inventory.raw_paths)} RAW; "
+            f"{len(inventory.other_image_paths)} other image; "
+            f"{inventory.ignored_file_count} other file(s); "
+            f"{inventory.total_jpeg_bytes / 1_048_576:.1f} MB"
+        )
+        self._append_manual(
+            f"Matching: {match_method}; include subfolders={bool(self.recursive_var.get())}"
+        )
+        self._append_manual(
             "Orientation: "
             f"source={attitude_source}; facing={camera_facing:g}°; "
             f"down={camera_down_angle:g}°; image rotation={image_rotation:g}°"
@@ -570,6 +704,8 @@ class TaggerApp:
         self.status_dot.configure(fg=BLUE_HOVER)
         self.run_button.configure(state="disabled")
         self.open_button.configure(state="disabled")
+        self.cancel_event.clear()
+        self.cancel_button.configure(state="normal")
         self._progress_is_determinate = False
         self.progress.configure(mode="indeterminate", maximum=max(jpeg_count, 1), value=0)
         self.progress.start(12)
@@ -577,7 +713,7 @@ class TaggerApp:
             log=log,
             images=images,
             output=output,
-            match=str(self.config["match_method"]),
+            match=match_method,
             attitude_source=attitude_source,
             tolerance=float(self.config["timestamp_tolerance_s"]),
             mount_roll=float(self.config["mount_roll_deg"]),
@@ -587,6 +723,8 @@ class TaggerApp:
             camera_down_angle=camera_down_angle,
             image_rotation=image_rotation,
             overwrite=bool(self.overwrite_var.get()),
+            recursive=bool(self.recursive_var.get()),
+            cancel_event=self.cancel_event,
             progress_callback=self._queue_progress,
         )
         self.worker = threading.Thread(target=self._run_worker, args=(args,), daemon=True)
@@ -604,6 +742,10 @@ class TaggerApp:
             stdout_writer.flush()
             stderr_writer.flush()
             self.messages.put(("done", result, str(args.output)))
+        except engine.TaggerCancelled as exc:
+            stdout_writer.flush()
+            stderr_writer.flush()
+            self.messages.put(("cancelled", str(exc)))
         except Exception as exc:
             stdout_writer.flush()
             stderr_writer.flush()
@@ -635,19 +777,45 @@ class TaggerApp:
                     self.progress.stop()
                     self.progress.configure(mode="determinate", value=self.progress["maximum"])
                     self.run_button.configure(state="normal")
+                    self.cancel_button.configure(state="disabled")
                     self.open_button.configure(state="normal")
                     self.status_dot.configure(fg="#3fb950")
                     self.status_var.set("Complete — every tagged copy passed verification.")
                     self.progress_detail_var.set("Ready for Pix4Dmapper")
                     self._append_manual("FINAL RESULT: SUCCESS — every tagged copy passed verification.")
                     log_path = self._save_session_log(Path(message[2]), "SUCCESS — all output images verified")
+                    if self.close_after_worker:
+                        self.root.destroy()
+                        return
                     messagebox.showinfo(
                         APP_TITLE,
                         f"Pix4D-ready copies are complete.\n\n{message[2]}\n\nConversion log:\n{log_path}",
                     )
+                elif kind == "cancelled":
+                    self.progress.stop()
+                    self.progress.configure(mode="determinate", value=0)
+                    self.run_button.configure(state="normal")
+                    self.cancel_button.configure(state="disabled")
+                    self.open_button.configure(state="disabled")
+                    self.status_dot.configure(fg=YELLOW)
+                    self.status_var.set("Cancelled — temporary staged files were removed.")
+                    self.progress_detail_var.set("Original images were not modified")
+                    self._append_manual(f"FINAL RESULT: CANCELLED — {message[1]}")
+                    log_path = self._save_session_log(
+                        Path(self.output_var.get().strip()), f"CANCELLED — {message[1]}"
+                    )
+                    if self.close_after_worker:
+                        self.root.destroy()
+                        return
+                    messagebox.showwarning(
+                        APP_TITLE,
+                        f"{message[1]}\n\nConversion log:\n{log_path}",
+                    )
                 elif kind == "error":
                     self.progress.stop()
                     self.run_button.configure(state="normal")
+                    self.cancel_button.configure(state="disabled")
+                    self.open_button.configure(state="disabled")
                     self.status_dot.configure(fg=RED)
                     self.status_var.set("Stopped — review the red log entries below.")
                     self.progress_detail_var.set("No complete output set was produced")
@@ -657,12 +825,15 @@ class TaggerApp:
                     log_path = self._save_session_log(
                         Path(self.output_var.get().strip()), f"FAILED — {message[1]}"
                     )
+                    if self.close_after_worker:
+                        self.root.destroy()
+                        return
                     messagebox.showerror(APP_TITLE, f"{message[1]}\n\nConversion log:\n{log_path}")
         except queue.Empty:
             pass
         self.root.after(100, self._poll_messages)
 
-    def _save_session_log(self, requested_output: Path, result: str) -> Path:
+    def _save_session_log(self, requested_output: Path, result: str) -> str:
         target = requested_output
         try:
             source = Path(self.images_var.get().strip()).resolve()
@@ -671,28 +842,39 @@ class TaggerApp:
                 target = requested_output.parent
         except (OSError, RuntimeError):
             pass
-        try:
-            return engine.save_conversion_log(
-                target,
-                self.session_log_lines,
-                APP_VERSION,
-                result,
-                created_at=self.session_started,
-            )
-        except OSError as exc:
-            fallback = Path(self.log_var.get().strip()).parent
-            self._append_log(
-                datetime.now().strftime("%H:%M:%S"),
-                f"WARNING: Could not save conversion log in {target}: {exc}. Using {fallback}.",
-                "stderr",
-            )
-            return engine.save_conversion_log(
-                fallback,
-                self.session_log_lines,
-                APP_VERSION,
-                result,
-                created_at=self.session_started,
-            )
+        candidates = [
+            target,
+            Path(self.log_var.get().strip()).parent,
+            Path(tempfile.gettempdir()) / "PX4_Pix4D_Tagger_Logs",
+        ]
+        attempted: set[Path] = set()
+        last_error: OSError | None = None
+        for candidate in candidates:
+            try:
+                resolved = candidate.resolve()
+            except OSError:
+                resolved = candidate
+            if resolved in attempted:
+                continue
+            attempted.add(resolved)
+            try:
+                return str(engine.save_conversion_log(
+                    candidate,
+                    self.session_log_lines,
+                    APP_VERSION,
+                    result,
+                    created_at=self.session_started,
+                ))
+            except OSError as exc:
+                last_error = exc
+                self._append_log(
+                    datetime.now().strftime("%H:%M:%S"),
+                    f"WARNING: Could not save conversion log in {candidate}: {exc}",
+                    "stderr",
+                )
+        failure = f"NOT SAVED — all log locations failed: {last_error}"
+        self._append_log(datetime.now().strftime("%H:%M:%S"), f"ERROR: {failure}", "stderr")
+        return failure
 
     def _open_output(self) -> None:
         path = Path(self.output_var.get().strip())

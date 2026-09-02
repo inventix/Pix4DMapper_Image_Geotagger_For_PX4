@@ -1,9 +1,11 @@
 from dataclasses import replace
+import csv
 from io import BytesIO
 from pathlib import Path
 from argparse import Namespace
 from datetime import datetime, timezone
 from types import SimpleNamespace
+import threading
 
 import numpy as np
 import pytest
@@ -25,6 +27,27 @@ def jpeg_fixture() -> bytes:
     exif[37386] = (24, 1)
     image.save(buffer, format="JPEG", quality=93, exif=exif)
     return buffer.getvalue()
+
+
+def process_args(log_path, image_dir, output_dir, **overrides):
+    values = {
+        "log": log_path,
+        "images": image_dir,
+        "output": output_dir,
+        "match": "auto",
+        "tolerance": 2.0,
+        "mount_roll": 0.0,
+        "mount_pitch": 0.0,
+        "mount_yaw": 0.0,
+        "camera_facing": 0.0,
+        "camera_down_angle": 90.0,
+        "image_rotation": 0.0,
+        "attitude_source": "body",
+        "overwrite": False,
+        "recursive": False,
+    }
+    values.update(overrides)
+    return Namespace(**values)
 
 
 def capture(index=0, time_s=10.0, yaw=0.0, pitch=0.0, roll=0.0):
@@ -233,6 +256,16 @@ def test_load_captures_body_source_requires_vehicle_attitude(tmp_path, monkeypat
         tagger.load_captures(log, attitude_source="body")
 
 
+def test_load_captures_explains_unbracketed_body_attitude(tmp_path, monkeypatch):
+    log = tmp_path / "flight.ulg"
+    log.write_bytes(b"synthetic")
+    fake = synthetic_ulog()
+    fake.data_list[1].data["timestamp_sample"] = np.array([2_000_000, 2_100_000])
+    monkeypatch.setattr(tagger, "ULog", lambda *args, **kwargs: fake)
+    with pytest.raises(tagger.TaggerError, match="without nearby vehicle_attitude samples"):
+        tagger.load_captures(log, attitude_source="body")
+
+
 def test_tagged_jpeg_has_verified_metadata_and_same_scan():
     source = jpeg_fixture()
     event = capture(yaw=42, pitch=3, roll=-4)
@@ -330,6 +363,58 @@ def test_auto_matching_rejects_incomplete_ambiguous_dataset():
         tagger.match_images(images, captures, "auto", 2.0)
 
 
+def test_inventory_classifies_mixed_camera_files_and_subfolders(tmp_path):
+    (tmp_path / "nested").mkdir()
+    (tmp_path / "Alpha.JPE").write_bytes(jpeg_fixture())
+    (tmp_path / "nested" / "not_a_sony_name.jpeg").write_bytes(jpeg_fixture())
+    (tmp_path / "frame.DNG").write_bytes(b"raw placeholder")
+    (tmp_path / "preview.TIFF").write_bytes(b"tiff placeholder")
+    (tmp_path / "notes.txt").write_text("notes", encoding="utf-8")
+    top_only = tagger.inventory_images(tmp_path)
+    recursive = tagger.inventory_images(tmp_path, recursive=True)
+    assert top_only.jpeg_paths == (Path("Alpha.JPE"),)
+    assert recursive.jpeg_paths == (Path("Alpha.JPE"), Path("nested/not_a_sony_name.jpeg"))
+    assert recursive.raw_paths == (Path("frame.DNG"),)
+    assert recursive.other_image_paths == (Path("preview.TIFF"),)
+    assert recursive.ignored_file_count == 1
+    assert recursive.nested_jpeg_count == 1
+
+
+def test_load_images_accepts_arbitrary_names_and_camera_makes(tmp_path):
+    first = tmp_path / "survey-a.jpe"
+    second = tmp_path / "CAMERA_000002.JPEG"
+    first.write_bytes(jpeg_fixture())
+    second.write_bytes(jpeg_fixture())
+    records = tagger.load_images(tmp_path)
+    assert [record.path.name for record in records] == ["CAMERA_000002.JPEG", "survey-a.jpe"]
+    assert all(record.time_s is not None for record in records)
+
+
+def test_load_images_rejects_file_disguised_with_jpeg_extension(tmp_path):
+    image = Image.new("RGB", (10, 10), "red")
+    image.save(tmp_path / "actually_png.jpg", format="PNG")
+    with pytest.raises(tagger.TaggerError, match="actually PNG"):
+        tagger.load_images(tmp_path)
+
+
+def test_load_images_explains_that_raw_must_be_converted(tmp_path):
+    (tmp_path / "flight_image.CR3").write_bytes(b"raw placeholder")
+    with pytest.raises(tagger.TaggerError, match="Convert/export them to JPEG first"):
+        tagger.load_images(tmp_path)
+
+
+@pytest.mark.parametrize(("method", "tolerance"), [("guess", 2.0), ("auto", -0.1), ("time", float("nan"))])
+def test_matching_rejects_invalid_controls(method, tolerance):
+    with pytest.raises(tagger.TaggerError):
+        tagger.match_images([tagger.ImageRecord(Path("a.jpg"), 1.0)], [capture()], method, tolerance)
+
+
+def test_disk_capacity_check_reports_required_and_available_space(tmp_path, monkeypatch):
+    monkeypatch.setattr(tagger.shutil, "disk_usage", lambda _path: SimpleNamespace(free=1_048_576))
+    with pytest.raises(tagger.TaggerError, match="Need about 20 MB"):
+        tagger.verify_output_capacity(tmp_path / "new" / "tagged", 20 * 1_048_576)
+
+
 def test_end_to_end_writes_copy_and_report(tmp_path, monkeypatch):
     image_dir = tmp_path / "original"
     output_dir = tmp_path / "tagged"
@@ -340,29 +425,166 @@ def test_end_to_end_writes_copy_and_report(tmp_path, monkeypatch):
     event = capture(time_s=100.0, yaw=75, pitch=2, roll=-1)
     monkeypatch.setattr(tagger, "load_captures", lambda _, attitude_source="body": [event])
     progress_events = []
-    args = Namespace(
-        log=log_path,
-        images=image_dir,
-        output=output_dir,
-        match="auto",
-        tolerance=2.0,
-        mount_roll=0.0,
-        mount_pitch=0.0,
-        mount_yaw=0.0,
-        overwrite=False,
+    args = process_args(
+        log_path,
+        image_dir,
+        output_dir,
         progress_callback=lambda *event: progress_events.append(event),
     )
     assert tagger.process(args) == 0
     tagged_path = output_dir / "DSC00001.JPG"
     assert tagged_path.exists()
     assert (output_dir / "tagging_report.csv").exists()
-    assert progress_events[-1] == (1, 1, "DSC00001.JPG", "Verified and saved image")
+    assert progress_events[-1] == (1, 1, "DSC00001.JPG", "Verified and staged image")
+    with (output_dir / "tagging_report.csv").open(newline="", encoding="utf-8") as stream:
+        report = next(csv.DictReader(stream))
+    assert report["image"] == "DSC00001.JPG"
+    assert report["source_bytes"] == str(len(jpeg_fixture()))
+    assert report["source_sha256"]
+    assert report["attitude_source"] == "body"
+    assert report["match_method"] == "auto"
     tagger.verify_output(
         (image_dir / "DSC00001.JPG").read_bytes(),
         tagged_path.read_bytes(),
         event,
         tagger.pix4d_ypr(event.quaternion_wxyz),
     )
+
+
+def test_recursive_end_to_end_preserves_relative_folders(tmp_path, monkeypatch):
+    image_dir = tmp_path / "original"
+    output_dir = tmp_path / "tagged"
+    (image_dir / "camera_a").mkdir(parents=True)
+    (image_dir / "camera_b").mkdir()
+    (image_dir / "camera_a" / "IMG_1.JPG").write_bytes(jpeg_fixture())
+    (image_dir / "camera_b" / "IMG_1.JPG").write_bytes(jpeg_fixture())
+    log_path = tmp_path / "flight.ulg"
+    log_path.write_bytes(b"placeholder")
+    monkeypatch.setattr(
+        tagger,
+        "load_captures",
+        lambda _, attitude_source="body": [capture(0), capture(1)],
+    )
+    args = process_args(log_path, image_dir, output_dir, match="order", recursive=True)
+    assert tagger.process(args) == 0
+    assert (output_dir / "camera_a" / "IMG_1.JPG").is_file()
+    assert (output_dir / "camera_b" / "IMG_1.JPG").is_file()
+    with (output_dir / "tagging_report.csv").open(newline="", encoding="utf-8") as stream:
+        names = [row["image"] for row in csv.DictReader(stream)]
+    assert names == ["camera_a/IMG_1.JPG", "camera_b/IMG_1.JPG"]
+
+
+def test_cancellation_removes_staging_and_publishes_no_images(tmp_path, monkeypatch):
+    image_dir = tmp_path / "original"
+    output_dir = tmp_path / "tagged"
+    image_dir.mkdir()
+    (image_dir / "IMG_1.JPG").write_bytes(jpeg_fixture())
+    log_path = tmp_path / "flight.ulg"
+    log_path.write_bytes(b"placeholder")
+    monkeypatch.setattr(tagger, "load_captures", lambda _, attitude_source="body": [capture()])
+    cancel_event = threading.Event()
+
+    def cancel_after_staging(_current, _total, _name, stage):
+        if stage == "Verified and staged image":
+            cancel_event.set()
+
+    args = process_args(
+        log_path,
+        image_dir,
+        output_dir,
+        cancel_event=cancel_event,
+        progress_callback=cancel_after_staging,
+    )
+    with pytest.raises(tagger.TaggerCancelled, match="No staged images were published"):
+        tagger.process(args)
+    assert not output_dir.exists()
+    assert not list(tmp_path.glob(".tagged.staging-*"))
+
+
+def test_parser_supports_recursive_image_discovery():
+    args = tagger.build_parser().parse_args(["flight.ulg", "images", "output", "--recursive"])
+    assert args.recursive is True
+
+
+def test_process_rejects_output_inside_source_tree(tmp_path):
+    image_dir = tmp_path / "original"
+    image_dir.mkdir()
+    log_path = tmp_path / "flight.ulg"
+    log_path.write_bytes(b"placeholder")
+    with pytest.raises(tagger.TaggerError, match="inside it"):
+        tagger.process(process_args(log_path, image_dir, image_dir / "tagged"))
+
+
+def test_process_rejects_output_path_that_is_a_file(tmp_path):
+    image_dir = tmp_path / "original"
+    image_dir.mkdir()
+    log_path = tmp_path / "flight.ulg"
+    log_path.write_bytes(b"placeholder")
+    output_path = tmp_path / "tagged"
+    output_path.write_text("not a folder", encoding="utf-8")
+    with pytest.raises(tagger.TaggerError, match="not a folder"):
+        tagger.process(process_args(log_path, image_dir, output_path))
+
+
+def test_process_rejects_nonempty_output_without_overwrite(tmp_path):
+    image_dir = tmp_path / "original"
+    image_dir.mkdir()
+    output_dir = tmp_path / "tagged"
+    output_dir.mkdir()
+    (output_dir / "keep.txt").write_text("existing", encoding="utf-8")
+    log_path = tmp_path / "flight.ulg"
+    log_path.write_bytes(b"placeholder")
+    with pytest.raises(tagger.TaggerError, match="not empty"):
+        tagger.process(process_args(log_path, image_dir, output_dir))
+
+
+def test_overwrite_publish_preserves_unrelated_output_files(tmp_path, monkeypatch):
+    image_dir = tmp_path / "original"
+    image_dir.mkdir()
+    (image_dir / "IMG_1.JPG").write_bytes(jpeg_fixture())
+    output_dir = tmp_path / "tagged"
+    output_dir.mkdir()
+    (output_dir / "keep.txt").write_text("existing", encoding="utf-8")
+    (output_dir / "IMG_1.JPG").write_bytes(b"old output")
+    log_path = tmp_path / "flight.ulg"
+    log_path.write_bytes(b"placeholder")
+    monkeypatch.setattr(tagger, "load_captures", lambda _, attitude_source="body": [capture()])
+    assert tagger.process(process_args(log_path, image_dir, output_dir, overwrite=True)) == 0
+    assert (output_dir / "keep.txt").read_text(encoding="utf-8") == "existing"
+    assert (output_dir / "IMG_1.JPG").read_bytes() != b"old output"
+    assert not list(tmp_path.glob(".tagged.previous-*"))
+
+
+def test_cancellation_preserves_entire_existing_output_folder(tmp_path, monkeypatch):
+    image_dir = tmp_path / "original"
+    image_dir.mkdir()
+    (image_dir / "IMG_1.JPG").write_bytes(jpeg_fixture())
+    output_dir = tmp_path / "tagged"
+    output_dir.mkdir()
+    (output_dir / "IMG_1.JPG").write_bytes(b"known old output")
+    (output_dir / "keep.txt").write_text("existing", encoding="utf-8")
+    log_path = tmp_path / "flight.ulg"
+    log_path.write_bytes(b"placeholder")
+    monkeypatch.setattr(tagger, "load_captures", lambda _, attitude_source="body": [capture()])
+    cancel_event = threading.Event()
+
+    def cancel_after_staging(_current, _total, _name, stage):
+        if stage == "Verified and staged image":
+            cancel_event.set()
+
+    args = process_args(
+        log_path,
+        image_dir,
+        output_dir,
+        overwrite=True,
+        cancel_event=cancel_event,
+        progress_callback=cancel_after_staging,
+    )
+    with pytest.raises(tagger.TaggerCancelled):
+        tagger.process(args)
+    assert (output_dir / "IMG_1.JPG").read_bytes() == b"known old output"
+    assert (output_dir / "keep.txt").read_text(encoding="utf-8") == "existing"
+    assert not list(tmp_path.glob(".tagged.staging-*"))
 
 
 def test_conversion_log_contains_version_result_and_visible_lines(tmp_path):

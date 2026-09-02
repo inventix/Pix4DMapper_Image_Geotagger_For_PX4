@@ -7,7 +7,7 @@ automated tests and this real-flight acceptance test pass.
 
 The default course configuration assumes:
 
-- The RX0 II lens points straight down.
+- The camera lens points straight down.
 - The top edge of the saved photograph points toward the aircraft nose.
 - The right edge of the saved photograph points toward aircraft right.
 
@@ -19,18 +19,20 @@ guess it.
 ## 2. Run the automated tests
 
 On Windows, double-click `Run_Automated_Tests.bat`. On macOS or Linux, run
-`Run_Automated_Tests.sh`. It should finish with `6 passed`; the Windows script
+`Run_Automated_Tests.sh`. It should finish with `278 passed`; the Windows script
 also prints `All automated tests passed`.
 
 These tests verify:
 
-- PX4 quaternion conversion for the nominal rigid nadir mount.
+- Hundreds of rigid-mount orientation combinations and PX4 quaternion interpolation.
 - EXIF GPS writing and rereading.
 - Pix4D XMP yaw/pitch/roll writing and rereading.
 - Replacement instead of duplication when a file is tagged twice.
 - Automatic camera-clock offset estimation.
 - An end-to-end copied-JPEG and audit-report workflow.
 - Byte-for-byte preservation of the JPEG compressed scan data.
+- Mixed camera filenames/extensions, recursive subfolders, disk-space rejection,
+  safe cancellation cleanup, and unique conversion logs.
 
 ## 3. Prepare a small real-flight test
 
@@ -48,20 +50,23 @@ may correspond to trigger-command time instead of the exposure instant.
 
 ## 4. Run the graphical application
 
-1. Double-click `Launch_PX4_Pix4D_Tagger.bat`.
+1. Double-click the released `PX4_Pix4D_Tagger.exe`.
 2. Select the test `.ulg`.
 3. Select the original JPEG folder.
-4. Accept a new output folder.
-5. Click **Create Pix4D Images**.
+4. Select the tested attitude source and measured fixed-mount orientation.
+5. Accept a new output folder and leave matching on Automatic.
+6. Click **Create Pix4D Images** and verify the preflight inventory.
 
 Pass criteria:
 
 - The application reports completion without errors.
 - Output JPEG count equals input JPEG count.
 - `tagging_report.csv` contains one row per JPEG.
+- A timestamped `conversion_log_*.txt` records the successful run.
 - No original file's timestamp, size, or contents change.
 - Match errors are small and consistent. Investigate large or irregular errors.
 - Capture sequences increase in the same order as image filenames/timestamps.
+- Cancelling a separate trial run leaves no staged images or temporary folder.
 
 ## 5. Inspect capture-feedback status
 
@@ -117,6 +122,7 @@ Before publication, record:
 - Camera trigger interface and `CAM_CAP_FBACK`/`CAM_CAP_MODE` values.
 - RX0 II still-image mode and relevant firmware version.
 - Physical mount convention and measured offsets.
+- Selected attitude source, matching method, and saved conversion log.
 - Pix4Dmapper version.
 - Test image count, calibrated count, and observed orientation residuals.
 - Any warnings or required workarounds.

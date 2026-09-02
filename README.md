@@ -1,148 +1,89 @@
 # PX4 → Pix4D JPEG Tagger
 
-A desktop tool that copies Sony RX0 II JPEG photographs, matches them to PX4
-`.ulg` camera-capture records, and writes the GPS and camera orientation metadata
-needed by Pix4Dmapper.
+An open-source Windows desktop tool that matches camera JPEGs to PX4 `.ulg`
+capture records and writes the GPS and camera-orientation metadata used by
+Pix4Dmapper. Processing is fully local: flight logs and photographs are not
+uploaded, and the original images are never changed.
 
-> **Windows students: download the Windows application below.**
-> You do not need Python, an IDE, or an internet connection to run it.
+> **Windows students: use the ready-made application.** Python, an IDE, an
+> internet connection, and administrator rights are not required after the ZIP
+> is downloaded and extracted.
 
-## Windows student download
+## Download for Windows
 
-### 1. Download the application
+[**Download the latest Windows application**](https://github.com/inventix/Pix4DMapper_Image_Geotagger_For_PX4/releases/latest/download/PX4_Pix4D_Tagger_Windows.zip)
 
-[**Download the latest Windows version**](https://github.com/inventix/Pix4DMapper_Image_Geotagger_For_PX4/releases/latest/download/PX4_Pix4D_Tagger_Windows.zip)
+1. Download `PX4_Pix4D_Tagger_Windows.zip`.
+2. In File Explorer, right-click the ZIP and select **Extract All**.
+3. Open the extracted folder. Do not run the program from inside the ZIP.
+4. Keep `PX4_Pix4D_Tagger.exe` and `course_config.json` together.
+5. Double-click `PX4_Pix4D_Tagger.exe`.
 
-The download contains:
-
-- `PX4_Pix4D_Tagger.exe` — the complete Windows application.
-- `course_config.json` — the instructor-controlled course settings.
-
-### 2. Extract the download
-
-1. Open `PX4_Pix4D_Tagger_Windows.zip`.
-2. Click **Extract All**.
-3. Choose a normal location such as `Documents\PX4 Pix4D Tagger`.
-4. Open the extracted folder.
-
-Do not run the application from inside the ZIP file. Keep
-`course_config.json` in the same folder as the EXE.
-
-### 3. Run the application
-
-Double-click `PX4_Pix4D_Tagger.exe`.
-
-The program runs entirely on the Windows computer. It does not upload flight
-logs or photographs, and it does not require Python or internet access after
-the ZIP has been downloaded.
-
-The published application is a self-contained 64-bit build for supported
-64-bit Windows 10 and Windows 11 computers. Windows may show a Microsoft
-Defender SmartScreen warning because this open-source build is not yet
-commercially code-signed. Confirm that the file came from this repository
-before choosing **More info → Run anyway**.
-
-## Build status and source code
-
-Every Windows release is built from the public source code by GitHub Actions.
-The automated test suite must pass before the versioned release is published.
-
-Developers can inspect or download the complete source from this repository.
-Python 3.11 or newer is required only to run or build from source; ordinary
-Windows students should use the released EXE above.
+The release is a traditional self-contained 64-bit `.exe` for 64-bit Windows
+10 and Windows 11. It runs offline and stores output only in the folder the user
+selects. Windows may show a Microsoft Defender SmartScreen warning because the
+open-source build is not yet commercially code-signed. Confirm that the file
+came from this repository before selecting **More info → Run anyway**.
 
 ## Tag one flight
 
-Prepare these items before opening the tool:
+Prepare the PX4 `.ulg` flight log, the original camera images from that flight,
+and a location for the new tagged copies. Then:
 
-- The PX4 `.ulg` flight log.
-- A folder containing **only the original Sony JPEGs from that flight**.
-- A new or empty folder for the tagged copies.
+1. On **FLIGHT DATA**, select the `.ulg` log, image folder, and output folder.
+2. Enable **Include JPEGs in subfolders** only if the flight images are nested.
+3. Leave **Image matching** on Automatic unless an instructor directs otherwise.
+4. On **ORIENTATION**, describe the camera's physical fixed mount.
+5. Select **Create Pix4D Images** and review the preflight summary.
+6. Wait for the green completed status, then import the output folder into
+   Pix4Dmapper.
 
-Then:
+The output contains verified tagged JPEG copies, `tagging_report.csv`, and a
+timestamped `conversion_log_*.txt`. The log records the selected inputs,
+settings, image-by-image progress, warnings, written orientation values, and
+final success, failure, or cancellation result.
 
-1. Double-click `Launch_PX4_Pix4D_Tagger.bat`.
-2. Select the PX4 `.ulg` flight log.
-3. Select the folder containing that flight's original Sony JPEGs.
-4. Accept the suggested output folder or select another empty folder.
-5. Click **Create Pix4D Images**.
-6. Wait for the green completed status.
-7. Import the completed output folder into Pix4Dmapper.
+## Supported camera files
 
-The program does not modify the original photographs. It creates tagged copies
-and writes `tagging_report.csv` into the output folder.
+The current version tags JPEG files with `.jpg`, `.jpeg`, or `.jpe` extensions.
+Camera brand and filename pattern do not matter. Files can have arbitrary names,
+and optional recursive discovery preserves their relative subfolders.
 
-## Windows troubleshooting
+RAW formats such as DNG, CR2/CR3, NEF, ARW, RAF, ORF, RW2, and PEF are detected
+and reported but are not modified or converted. TIFF, PNG, HEIC, WebP, and other
+image formats are also reported and ignored. Export these files to JPEG with the
+camera manufacturer's software or another trusted converter before tagging.
 
-### “Python 3.11 or newer is not installed”
+The tool checks that every JPEG extension actually contains JPEG data. A damaged
+file or a renamed non-JPEG stops the run with the filename and a clear error.
 
-Install the latest stable 64-bit Python 3 release from the
-[official Windows download page](https://www.python.org/downloads/windows/),
-then double-click the launcher again.
+## Matching choices
 
-### Setup did not finish
+| Choice | Behavior | Use when |
+| --- | --- | --- |
+| Automatic | Prefers EXIF timestamps; uses capture order only when the counts are an unambiguous one-to-one match | Most flights |
+| Timestamps only | Requires a usable EXIF capture time on every JPEG | Camera clock and timestamps are trustworthy |
+| Capture order | Requires exactly the same number of JPEGs and valid PX4 captures | An instructor has verified a one-to-one ordered dataset |
 
-Check the internet connection, close the setup window, and double-click
-`Launch_PX4_Pix4D_Tagger.bat` again. If the problem continues, give the
-instructor the complete message shown in the setup window.
-
-### The program was opened inside the ZIP
-
-Close it, right-click the ZIP, select **Extract All**, open the extracted folder,
-and run `Launch_PX4_Pix4D_Tagger.bat` there.
-
-### Windows hides the `.bat` ending
-
-In the extracted folder, select the file named
-**Launch_PX4_Pix4D_Tagger** whose Type is **Windows Batch File**.
-
-## Instructor and developer build from source
-
-Ordinary students should use the published EXE. To reproduce the Windows build
-from the open-source code, an instructor or developer can build it locally:
-
-1. Use a Windows computer with Python 3.11 or newer installed.
-2. Download and extract the complete repository.
-3. Double-click `Build_Standalone_Windows_EXE.bat`.
-4. After the build completes, open the `dist` folder.
-5. Deploy these two files together:
-   - `PX4_Pix4D_Tagger.exe`
-   - `course_config.json`
-6. Acceptance-test them on one lab computer before broad deployment.
-
-Students using that standalone build do not need Python, the repository, or a
-command prompt. The Windows EXE must be built on Windows.
-
-Before classroom deployment or public release, complete
-[VERIFICATION_CHECKLIST.md](VERIFICATION_CHECKLIST.md) with a real PX4 log,
-matching RX0 II photographs, and the installed Pix4Dmapper version.
+The program refuses to publish a partial dataset when every image cannot be
+matched. Unrelated images from another flight should be removed from the source
+folder before processing.
 
 ## Orientation page
 
-The **ORIENTATION** page converts aircraft attitude into the physical camera
-attitude for every exposure.
+For a rigid camera mount, choose **Aircraft body — fixed camera (recommended)**.
+The tool interpolates PX4 `vehicle_attitude.q` to each `camera_capture` timestamp
+and composes that body orientation with the physical camera mount.
 
-### Attitude source
+Describe the mount with:
 
-- **Aircraft body — fixed camera (recommended):** reads PX4
-  `vehicle_attitude.q` and interpolates it to each camera-capture timestamp.
-- **Logged camera/gimbal:** uses `camera_capture.q` directly. Select this only
-  when the log's camera or gimbal attitude is intentionally required.
+- **Camera faces:** forward, right, rear, left, or a custom direction.
+- **Facing angle:** degrees clockwise from the aircraft nose.
+- **Downward angle:** degrees below the aircraft body horizon; `90°` is straight
+  down (nadir), while smaller values describe an oblique mount.
+- **Photo layout:** landscape, inverted landscape, or either portrait rotation.
 
-### Fixed-mount settings
-
-- **Camera faces:** forward/nose, right wing, rear/tail, left wing, or a custom
-  angle.
-- **Facing angle from nose:** degrees clockwise around the aircraft's down axis;
-  0° is forward, 90° is right, 180° is rear, and 270° is left.
-- **Downward angle:** angle below the aircraft body horizon; 0° looks forward
-  and **90° looks straight down (nadir)**.
-- **Photo layout:** landscape, landscape inverted, portrait clockwise, or
-  portrait counter-clockwise. This determines which physical direction is the
-  top edge of the photograph.
-
-For the described downward-facing landscape camera with its top edge toward the
-aircraft nose, use:
+For a downward-facing landscape camera whose image top points toward the nose:
 
 | Setting | Value |
 | --- | --- |
@@ -152,131 +93,128 @@ aircraft nose, use:
 | Downward angle | 90° |
 | Photo layout | Landscape — top edge toward camera facing |
 
-The program performs a full 3-D rotation. It does not simply add or subtract
-90° from aircraft pitch. DJI gimbal metadata commonly uses approximately −90°
-for a nadir gimbal, whereas Pix4D defines `Xmp.Camera.Pitch = 0°` as nadir and
-`90°` as forward-looking. Output is converted to Pix4D's convention.
+The calculation is a full three-dimensional rotation, not a scalar addition to
+pitch. DJI gimbal metadata commonly represents nadir near `−90°`, whereas
+Pix4D's `Xmp.Camera.Pitch` convention represents nadir as `0°` and forward as
+`90°`. This tool writes the converted Pix4D convention.
 
-## What the tool writes
+Choose **Logged camera/gimbal — use camera_capture.q** only when that field is
+known to be the required attitude source for the aircraft and payload.
 
-The tool writes:
+## Safety and audit behavior
 
-- Standard EXIF GPS latitude, longitude, altitude, and reference fields.
-- Pix4D `Xmp.Camera.Yaw`, `Pitch`, and `Roll` fields.
-- A CSV audit report describing every match and written value.
+Before processing, the application shows JPEG/RAW/other-file counts, input size,
+matching mode, attitude source, and mount settings. It also checks the output
+location and available disk space.
 
-It rereads every output file and verifies its GPS and orientation metadata. It
-also verifies that the compressed JPEG scan data is unchanged, so photographs
-are not recompressed.
+During processing it:
 
-## Assumed camera mounting
+1. Reads valid PX4 capture and attitude records.
+2. Requires a complete image-to-capture match.
+3. Writes all tagged files into a temporary sibling staging folder.
+4. Rereads each staged image and verifies GPS, yaw/pitch/roll, and unchanged
+   compressed JPEG scan data.
+5. Publishes the output set only after every staged image passes.
 
-The default is a rigid nadir mount:
+Cancellation or a processing failure removes temporary staged files. Existing
+source JPEGs are never overwritten. The CSV audit report includes relative
+filename, original size and SHA-256 hash, capture sequence/result, attitude
+source, matching method, GPS, Pix4D orientation, mount settings, time error, and
+unchanged-scan hash.
 
-- The lens points straight down along the aircraft's +Z/down axis.
-- The top edge of every photograph points toward the aircraft's nose.
-- The right edge of every photograph points toward aircraft right.
+## Troubleshooting
 
-This is Pix4D's documented `perpCamera=true` mounting. If the RX0 II is turned
-or tilted relative to this orientation, use mount offsets only after measuring
-them. Do not guess the offsets.
+### No supported JPEGs
 
-The graphical interface reads its locked mounting offsets and matching tolerance
-from `course_config.json`. Keep that file beside a standalone EXE. Students do
-not need to edit it.
+Enable subfolder discovery if appropriate. Otherwise, export RAW or other image
+formats to JPEG first. Do not merely rename a file extension.
 
-## Supported computers
+### `camera_capture` is missing
 
-The source GUI and command-line engine support:
+The selected ULog does not contain the PX4 capture events required for
+geotagging. Confirm camera triggering/capture logging was enabled and select the
+log from the matching flight.
 
-| Operating system | Student launcher |
-| --- | --- |
-| Windows | `Launch_PX4_Pix4D_Tagger.bat` |
-| macOS | `Launch_PX4_Pix4D_Tagger.command` |
-| Linux | `Launch_PX4_Pix4D_Tagger.sh` |
+### `vehicle_attitude` is missing or not close to captures
 
-Standalone applications must be built separately on each operating system with
-the corresponding `Build_Standalone_*` script. A Windows build cannot be used
-as a macOS or Linux application.
+Aircraft-body orientation requires valid `vehicle_attitude` samples around each
+capture timestamp. Confirm the complete, correct ULog was selected. Use logged
+camera/gimbal attitude only when `camera_capture.q` is known to be correct.
 
-Android and iOS are not included in this initial verified release.
+### Images do not all match
 
-## macOS note
+Use one flight per folder, remove unrelated files, check the camera clock and
+EXIF timestamps, or use order matching only after confirming equal one-to-one
+counts.
 
-Python 3.11 or newer is required. If setup reports that no version satisfies
-`numpy>=1.25`, install a current Python version from the
-[official Python macOS downloads page](https://www.python.org/downloads/macos/)
-and use the current launcher.
+### Output cannot be written
 
-## Manual command-line installation
+Choose a local folder where the user has write permission and enough free disk
+space. Avoid the source image folder, a folder inside it, read-only media, and a
+cloud folder that is currently offline.
 
-Ordinary students do not need this section. For manual use, install Python 3.11
-or newer, open PowerShell in the extracted repository folder, and run:
+### Windows blocks the application
+
+Confirm it came from this repository, extract the ZIP, then use **More info →
+Run anyway** if SmartScreen appears. An instructor can compare the release
+artifact with the public GitHub Actions build record.
+
+The GUI also has a **Troubleshooting** button. If a run fails, give the
+instructor the saved `conversion_log_*.txt`; it contains the detailed diagnostic
+trail without containing image data.
+
+## Build and run from source
+
+Students using the released EXE should skip this section. Developers and
+instructors need the latest stable 64-bit Python 3 (Python 3.11 or newer):
+
+1. Download Python from the [official Windows Python download page](https://www.python.org/downloads/windows/).
+2. Run the installer and enable **Add python.exe to PATH**.
+3. Open PowerShell in the extracted repository folder.
+4. Create the environment and install dependencies:
 
 ```powershell
-py -m venv .venv
+py -3.11 -m venv .venv
 .venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
 
-Run the command-line tagger with:
+Start the GUI with `Launch_PX4_Pix4D_Tagger.bat`, or run the command-line engine:
 
 ```powershell
 python px4_pix4d_tagger.py "C:\Flights\flight.ulg" "C:\Flights\Original" "C:\Flights\Pix4D_Tagged"
 ```
 
-The default `--match auto` mode uses the photographs' EXIF timestamps and PX4
-trigger timestamps. It automatically estimates a constant difference between
-the Sony and PX4 clocks. If every photograph and logged trigger are known to
-correspond one-for-one, ordered matching is available:
+Useful command-line options include `--recursive`, `--match auto|time|order`,
+`--attitude-source body|camera_capture`, `--camera-facing`,
+`--camera-down-angle`, and `--image-rotation`. Run
+`python px4_pix4d_tagger.py --help` for the complete list.
 
-```powershell
-python px4_pix4d_tagger.py flight.ulg Original Pix4D_Tagged --match order
-```
+To build the standalone Windows application, double-click
+`Build_Standalone_Windows_EXE.bat`. The resulting EXE must be built on Windows
+and acceptance-tested on a representative lab computer before deployment.
 
-The program aborts before writing if it cannot match every source photograph.
+## Verification and project history
 
-## Pix4Dmapper import
+The automated suite currently contains **278 pytest cases** covering camera
+mount rotations, body-attitude interpolation, GPS edge cases, JPEG/XMP/EXIF
+round trips, damaged inputs, matching modes, mixed file inventories, recursive
+folders, disk-space checks, cancellation cleanup, conversion logs, and complete
+staged output runs.
 
-Create a Pix4Dmapper project using the tagged copies. If the project was created
-before tagging, open Image Properties Editor and select **From EXIF**.
+GitHub Actions runs the tests and builds the Windows executable for pull
+requests. Published releases are created from versioned branches and tags, so
+earlier working releases remain downloadable and are not overwritten by current
+development.
 
-Pix4D should show image coordinates and converted Omega/Phi/Kappa values. Begin
-with **Standard Calibration**. Do not select **Accurate Geolocation and
-Orientation** unless the stated GPS and attitude accuracies have been
-independently validated.
-
-## Required real-flight validation
-
-Before operational or classroom use, verify with a real flight that:
-
-1. Every photograph is paired with the correct trigger.
-2. The initial camera-position plot follows the flown path.
-3. Image top points in the aircraft-forward direction.
-4. A level hover gives approximately 0° pitch and 0° roll in Pix4D's imported
-   camera-orientation convention.
-5. Pix4D's optimized camera orientations are reasonably close to the imported
-   orientations after Step 1.
-
-PX4's `camera_capture.q` contains vehicle attitude when no gimbal is present.
-For the documented rigid nadir mounting, Pix4D's conversion treats those body
-yaw, pitch, and roll values as the input orientation.
-
-## Automated verification
-
-The Windows build workflow runs **258 automated pytest cases** before producing
-an EXE. Coverage includes hundreds of landscape, portrait, cardinal, oblique,
-and randomized 3-D mount combinations; aircraft-body quaternion interpolation;
-GPS edge cases; XMP/EXIF replacement; unchanged JPEG scan data; timestamp and
-order matching; corrupted-output detection; and end-to-end output/report
-creation.
-
-These tests verify the software mechanics and mathematical invariants. A real
-PX4 log, matching camera images, and Pix4Dmapper processing remain required to
-validate the complete physical workflow and the measured camera mount.
+Automated tests cannot prove the complete physical workflow without real flight
+data. Before classroom or operational use, complete the
+[real-flight verification checklist](VERIFICATION_CHECKLIST.md) with a matching
+ULog, camera dataset, measured mount, and the installed Pix4Dmapper version.
 
 ## Technical documentation
 
 - [Technical implementation notes](TECHNICAL_NOTES.md)
-- [Verification checklist](VERIFICATION_CHECKLIST.md)
+- [Real-flight verification checklist](VERIFICATION_CHECKLIST.md)
 - [Automated tests](tests/test_tagger.py)

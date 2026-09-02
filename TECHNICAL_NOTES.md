@@ -94,3 +94,40 @@ to EXIF GPSAltitude with GPSAltitudeRef. The program deliberately does not claim
 a specific vertical datum in XMP because that depends on the GNSS/estimator and
 PX4 configuration. For survey-grade vertical results, GCPs or a validated
 RTK/PPK vertical workflow remain necessary.
+
+## Input discovery and format boundary
+
+The metadata writer intentionally accepts only files whose extensions are
+`.jpg`, `.jpeg`, or `.jpe` and whose decoded Pillow format is actually JPEG.
+Camera make/model and filename pattern are not used as acceptance criteria.
+Optional recursive discovery records and preserves the path relative to the
+selected source folder, which also prevents same-named images in separate
+subfolders from colliding.
+
+Common RAW and other image extensions are inventoried so the GUI can explain
+what will be ignored before processing. Converting RAW sensor data is outside
+the tagger's scope because a safe conversion requires deliberate demosaicing,
+color-profile, bit-depth, and compression choices. A file is never treated as a
+JPEG merely because its extension was renamed.
+
+## Staging, cancellation, and reports
+
+The engine estimates output capacity from the total JPEG input size and checks
+free space before reading the ULog. Tagged files are written under a unique
+temporary directory beside the requested output. Every file must pass metadata
+and unchanged-scan verification before that staged set is published. If the
+output path did not previously exist, publication is one same-filesystem
+directory rename.
+
+A cancellation event is checked before discovery boundaries, between ULog and
+matching work, before each image, and before publication. Exceptions and
+cancellation remove the staging directory in a `finally` block. The original
+image directory is always read-only from the engine's perspective.
+
+`tagging_report.csv` provides a machine-readable per-image audit trail,
+including the relative source name, original byte count and full-file SHA-256,
+capture status, selected attitude and match sources, written values, match
+error, and JPEG scan SHA-256. The GUI separately saves a timestamped,
+human-readable `conversion_log_*.txt` for successful, failed, and cancelled
+sessions. Unique filenames and atomic temporary-file replacement prevent logs
+from overwriting one another or leaving partial files.
