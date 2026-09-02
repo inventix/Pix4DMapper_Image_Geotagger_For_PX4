@@ -117,6 +117,46 @@ Before classroom deployment or public release, complete
 [VERIFICATION_CHECKLIST.md](VERIFICATION_CHECKLIST.md) with a real PX4 log,
 matching RX0 II photographs, and the installed Pix4Dmapper version.
 
+## Orientation page
+
+The **ORIENTATION** page converts aircraft attitude into the physical camera
+attitude for every exposure.
+
+### Attitude source
+
+- **Aircraft body — fixed camera (recommended):** reads PX4
+  `vehicle_attitude.q` and interpolates it to each camera-capture timestamp.
+- **Logged camera/gimbal:** uses `camera_capture.q` directly. Select this only
+  when the log's camera or gimbal attitude is intentionally required.
+
+### Fixed-mount settings
+
+- **Camera faces:** forward/nose, right wing, rear/tail, left wing, or a custom
+  angle.
+- **Facing angle from nose:** degrees clockwise around the aircraft's down axis;
+  0° is forward, 90° is right, 180° is rear, and 270° is left.
+- **Downward angle:** angle below the aircraft body horizon; 0° looks forward
+  and **90° looks straight down (nadir)**.
+- **Photo layout:** landscape, landscape inverted, portrait clockwise, or
+  portrait counter-clockwise. This determines which physical direction is the
+  top edge of the photograph.
+
+For the described downward-facing landscape camera with its top edge toward the
+aircraft nose, use:
+
+| Setting | Value |
+| --- | --- |
+| Attitude source | Aircraft body — fixed camera |
+| Camera faces | Forward / nose |
+| Facing angle | 0° |
+| Downward angle | 90° |
+| Photo layout | Landscape — top edge toward camera facing |
+
+The program performs a full 3-D rotation. It does not simply add or subtract
+90° from aircraft pitch. DJI gimbal metadata commonly uses approximately −90°
+for a nadir gimbal, whereas Pix4D defines `Xmp.Camera.Pitch = 0°` as nadir and
+`90°` as forward-looking. Output is converted to Pix4D's convention.
+
 ## What the tool writes
 
 The tool writes:
@@ -221,6 +261,19 @@ Before operational or classroom use, verify with a real flight that:
 PX4's `camera_capture.q` contains vehicle attitude when no gimbal is present.
 For the documented rigid nadir mounting, Pix4D's conversion treats those body
 yaw, pitch, and roll values as the input orientation.
+
+## Automated verification
+
+The Windows build workflow runs **258 automated pytest cases** before producing
+an EXE. Coverage includes hundreds of landscape, portrait, cardinal, oblique,
+and randomized 3-D mount combinations; aircraft-body quaternion interpolation;
+GPS edge cases; XMP/EXIF replacement; unchanged JPEG scan data; timestamp and
+order matching; corrupted-output detection; and end-to-end output/report
+creation.
+
+These tests verify the software mechanics and mathematical invariants. A real
+PX4 log, matching camera images, and Pix4Dmapper processing remain required to
+validate the complete physical workflow and the measured camera mount.
 
 ## Technical documentation
 
