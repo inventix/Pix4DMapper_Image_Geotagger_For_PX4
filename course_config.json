@@ -2,6 +2,10 @@
   "mount_roll_deg": 0.0,
   "mount_pitch_deg": 0.0,
   "mount_yaw_deg": 0.0,
+  "camera_facing_deg": 0.0,
+  "camera_down_angle_deg": 90.0,
+  "image_rotation_deg": 0.0,
+  "attitude_source": "body",
   "match_method": "auto",
   "timestamp_tolerance_s": 2.0
 }

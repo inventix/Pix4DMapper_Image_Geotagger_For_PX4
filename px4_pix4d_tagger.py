@@ -26,7 +26,7 @@ import numpy as np
 from lxml import etree
 from PIL import ExifTags, Image, TiffImagePlugin
 from pyulog import ULog
-from scipy.spatial.transform import Rotation
+from scipy.spatial.transform import Rotation, Slerp
 
 
 XMP_HEADER = b"http://ns.adobe.com/xap/1.0/\x00"
@@ -78,10 +78,44 @@ def _first(data: dict, *names: str):
     raise TaggerError(f"ULog field missing; tried: {', '.join(names)}")
 
 
-def load_captures(log_path: Path) -> list[Capture]:
+def interpolate_body_quaternion(
+    timestamps_s: Sequence[float], quaternions_wxyz: Sequence[Sequence[float]], target_s: float
+) -> tuple[float, float, float, float]:
+    """Interpolate PX4 body attitude at an exposure timestamp."""
+    times = np.asarray(timestamps_s, dtype=float)
+    quaternions = np.asarray(quaternions_wxyz, dtype=float)
+    if times.ndim != 1 or quaternions.shape != (len(times), 4) or len(times) < 1:
+        raise TaggerError("vehicle_attitude data has an invalid shape")
+    valid = np.isfinite(times) & np.all(np.isfinite(quaternions), axis=1)
+    valid &= np.linalg.norm(quaternions, axis=1) > 0.5
+    times, quaternions = times[valid], quaternions[valid]
+    if len(times) < 1:
+        raise TaggerError("vehicle_attitude contains no valid quaternion samples")
+    order = np.argsort(times, kind="stable")
+    times, quaternions = times[order], quaternions[order]
+    times, unique_indices = np.unique(times, return_index=True)
+    quaternions = quaternions[unique_indices]
+    if target_s < times[0] or target_s > times[-1]:
+        raise TaggerError("Capture timestamp falls outside the vehicle_attitude time range")
+    index = int(np.searchsorted(times, target_s))
+    if index < len(times) and abs(times[index] - target_s) < 1e-9:
+        q = quaternions[index] / np.linalg.norm(quaternions[index])
+        return tuple(float(value) for value in q)
+    before, after = index - 1, index
+    if before < 0 or after >= len(times) or times[after] - times[before] > 0.5:
+        raise TaggerError("No sufficiently close vehicle_attitude samples bracket the capture")
+    xyzw = quaternions[[before, after]][:, [1, 2, 3, 0]]
+    result = Slerp(times[[before, after]], Rotation.from_quat(xyzw))([target_s]).as_quat()[0]
+    return float(result[3]), float(result[0]), float(result[1]), float(result[2])
+
+
+def load_captures(log_path: Path, attitude_source: str = "body") -> list[Capture]:
     """Read valid camera_capture records from a PX4 ULog."""
+    if attitude_source not in {"body", "camera_capture"}:
+        raise TaggerError("Attitude source must be 'body' or 'camera_capture'")
     try:
-        ulog = ULog(str(log_path), message_name_filter_list=["camera_capture"])
+        topics = ["camera_capture", "vehicle_attitude"] if attitude_source == "body" else ["camera_capture"]
+        ulog = ULog(str(log_path), message_name_filter_list=topics)
     except Exception as exc:
         raise TaggerError(f"Could not read PX4 log {log_path}: {exc}") from exc
 
@@ -91,6 +125,27 @@ def load_captures(log_path: Path) -> list[Capture]:
             "No camera_capture topic is present in this ULog. Confirm PX4 camera "
             "capture feedback/logging was enabled for the flight."
         )
+
+    body_times: np.ndarray | None = None
+    body_quaternions: np.ndarray | None = None
+    if attitude_source == "body":
+        attitude_datasets = [d for d in ulog.data_list if d.name == "vehicle_attitude"]
+        if not attitude_datasets:
+            raise TaggerError(
+                "Aircraft-body orientation was selected, but vehicle_attitude is missing from the ULog. "
+                "Select logged camera/gimbal attitude only if camera_capture.q is known to be correct."
+            )
+        time_parts, quaternion_parts = [], []
+        for attitude in attitude_datasets:
+            data = attitude.data
+            attitude_time = _first(data, "timestamp_sample", "timestamp").astype(np.float64) / 1_000_000.0
+            attitude_q = np.column_stack(
+                [_first(data, f"q[{axis}]", f"q_{axis}") for axis in range(4)]
+            ).astype(float)
+            time_parts.append(attitude_time)
+            quaternion_parts.append(attitude_q)
+        body_times = np.concatenate(time_parts)
+        body_quaternions = np.concatenate(quaternion_parts)
 
     captures: list[Capture] = []
     raw_index = 0
@@ -120,7 +175,15 @@ def load_captures(log_path: Path) -> list[Capture]:
                 raw_index += 1
                 continue
             la, lo, al = float(lat[i]), float(lon[i]), float(alt[i])
-            q = tuple(float(q_fields[j][i]) for j in range(4))
+            if attitude_source == "body":
+                assert body_times is not None and body_quaternions is not None
+                try:
+                    q = interpolate_body_quaternion(body_times, body_quaternions, float(timestamp[i]))
+                except TaggerError:
+                    raw_index += 1
+                    continue
+            else:
+                q = tuple(float(q_fields[j][i]) for j in range(4))
             if not (
                 math.isfinite(la)
                 and math.isfinite(lo)
@@ -310,11 +373,70 @@ def rotation_matrix_xyz(roll_deg: float, pitch_deg: float, yaw_deg: float) -> np
     return Rotation.from_euler("ZYX", [yaw_deg, pitch_deg, roll_deg], degrees=True).as_matrix()
 
 
+def fixed_camera_body_from_image(
+    facing_deg: float = 0.0,
+    down_angle_deg: float = 90.0,
+    image_rotation_deg: float = 0.0,
+) -> np.ndarray:
+    """Return image axes expressed in the PX4 FRD body frame.
+
+    ``facing_deg`` is clockwise around body-down from the aircraft nose.
+    ``down_angle_deg`` is measured below the body X/Y plane: 0 looks toward
+    the horizon and 90 looks straight down. ``image_rotation_deg`` rotates
+    the physical camera clockwise as viewed from behind the camera; 0 means
+    landscape with the image top toward the selected facing direction.
+
+    Columns are image-right, image-top, and camera-back. This explicit vector
+    construction avoids treating DJI-style gimbal pitch (-90 at nadir) as
+    Pix4D Camera.Pitch (0 at nadir); those are different conventions.
+    """
+    values = (facing_deg, down_angle_deg, image_rotation_deg)
+    if not all(math.isfinite(float(value)) for value in values):
+        raise TaggerError("Camera orientation values must be finite numbers")
+    if not -90.0 <= float(down_angle_deg) <= 90.0:
+        raise TaggerError("Camera downward angle must be between -90 and 90 degrees")
+
+    heading = math.radians(float(facing_deg))
+    depression = math.radians(float(down_angle_deg))
+    # Optical direction points from the lens into the scene.
+    optical = np.array(
+        [
+            math.cos(depression) * math.cos(heading),
+            math.cos(depression) * math.sin(heading),
+            math.sin(depression),
+        ],
+        dtype=float,
+    )
+    camera_back = -optical
+    # Image top points toward the upper side of the view for an unrotated
+    # landscape camera and toward the chosen facing direction at nadir.
+    image_top = np.array(
+        [
+            math.sin(depression) * math.cos(heading),
+            math.sin(depression) * math.sin(heading),
+            -math.cos(depression),
+        ],
+        dtype=float,
+    )
+    image_right = np.cross(image_top, camera_back)
+
+    rotation = math.radians(float(image_rotation_deg))
+    rotated_right = math.cos(rotation) * image_right - math.sin(rotation) * image_top
+    rotated_top = math.sin(rotation) * image_right + math.cos(rotation) * image_top
+    matrix = np.column_stack((rotated_right, rotated_top, camera_back))
+    if not np.allclose(matrix.T @ matrix, np.eye(3), atol=1e-10) or np.linalg.det(matrix) < 0.999999:
+        raise TaggerError("Calculated camera frame is not a valid rotation")
+    return matrix
+
+
 def pix4d_ypr(
     quaternion_wxyz: Sequence[float],
     mount_roll_deg: float = 0,
     mount_pitch_deg: float = 0,
     mount_yaw_deg: float = 0,
+    camera_facing_deg: float | None = None,
+    camera_down_angle_deg: float | None = None,
+    image_rotation_deg: float | None = None,
 ) -> tuple[float, float, float]:
     """Convert PX4 body attitude plus rigid camera mount to Pix4D Y/P/R.
 
@@ -323,8 +445,15 @@ def pix4d_ypr(
     """
     w, x, y, z = quaternion_wxyz
     body_to_ned = Rotation.from_quat([x, y, z, w]).as_matrix()
-    mount_adjustment = rotation_matrix_xyz(mount_roll_deg, mount_pitch_deg, mount_yaw_deg)
-    body_from_image = PIX4D_DEFAULT_BODY_FROM_IMAGE @ mount_adjustment
+    if any(value is not None for value in (camera_facing_deg, camera_down_angle_deg, image_rotation_deg)):
+        if not all(value is not None for value in (camera_facing_deg, camera_down_angle_deg, image_rotation_deg)):
+            raise TaggerError("Facing, downward angle, and image rotation must be supplied together")
+        body_from_image = fixed_camera_body_from_image(
+            float(camera_facing_deg), float(camera_down_angle_deg), float(image_rotation_deg)
+        )
+    else:
+        mount_adjustment = rotation_matrix_xyz(mount_roll_deg, mount_pitch_deg, mount_yaw_deg)
+        body_from_image = PIX4D_DEFAULT_BODY_FROM_IMAGE @ mount_adjustment
     image_to_ned = body_to_ned @ body_from_image
     equivalent_body_to_ned = image_to_ned @ PIX4D_DEFAULT_BODY_FROM_IMAGE.T
     yaw, pitch, roll = Rotation.from_matrix(equivalent_body_to_ned).as_euler(
@@ -558,9 +687,15 @@ def process(args: argparse.Namespace) -> int:
     print(f"Original JPEGs:   {image_dir}")
     print(f"Tagged output:    {output_dir}")
     print(f"Match method:     {args.match} (tolerance {args.tolerance:.3f} s)")
+    attitude_source = getattr(args, "attitude_source", "body")
+    print(f"Attitude source:  {'PX4 vehicle_attitude (aircraft body)' if attitude_source == 'body' else 'camera_capture.q (camera/gimbal)'}")
+    camera_facing = getattr(args, "camera_facing", 0.0)
+    camera_down_angle = getattr(args, "camera_down_angle", 90.0)
+    image_rotation = getattr(args, "image_rotation", 0.0)
     print(
-        "Camera mount:     "
-        f"roll {args.mount_roll:.3f}°, pitch {args.mount_pitch:.3f}°, yaw {args.mount_yaw:.3f}°"
+        "Fixed camera:     "
+        f"faces {camera_facing:.3f}° clockwise from nose, "
+        f"{camera_down_angle:.3f}° down, image rotation {image_rotation:.3f}°"
     )
     print(f"Existing outputs: {'replace when names match' if args.overwrite else 'must be empty'}")
     print()
@@ -574,7 +709,7 @@ def process(args: argparse.Namespace) -> int:
 
     _notify_progress(args, 0, 0, log_path.name, "Reading PX4 camera captures…")
     print("STEP 2/5 — Read PX4 camera_capture records")
-    captures = load_captures(log_path)
+    captures = load_captures(log_path, attitude_source=attitude_source)
     confirmed = sum(capture.result == 1 for capture in captures)
     no_feedback_total = sum(capture.result == -1 for capture in captures)
     print(f"  Loaded {len(captures)} valid capture record(s).")
@@ -623,9 +758,9 @@ def process(args: argparse.Namespace) -> int:
         source = match.image.path.read_bytes()
         ypr = pix4d_ypr(
             match.capture.quaternion_wxyz,
-            args.mount_roll,
-            args.mount_pitch,
-            args.mount_yaw,
+            camera_facing_deg=camera_facing,
+            camera_down_angle_deg=camera_down_angle,
+            image_rotation_deg=image_rotation,
         )
         print(f"  Pix4D orientation: yaw {ypr[0]:.6f}°, pitch {ypr[1]:.6f}°, roll {ypr[2]:.6f}°")
         print("  Writing EXIF GPS and Pix4D XMP orientation blocks…")
@@ -657,6 +792,9 @@ def process(args: argparse.Namespace) -> int:
                 "pix4d_yaw_deg": f"{ypr[0]:.6f}",
                 "pix4d_pitch_deg": f"{ypr[1]:.6f}",
                 "pix4d_roll_deg": f"{ypr[2]:.6f}",
+                "camera_facing_deg_from_nose": f"{camera_facing:.6f}",
+                "camera_down_angle_deg": f"{camera_down_angle:.6f}",
+                "image_rotation_deg_clockwise": f"{image_rotation:.6f}",
                 "match_error_s": "" if match.time_error_s is None else f"{match.time_error_s:.6f}",
                 "scan_sha256": hashlib.sha256(jpeg_scan_bytes(tagged)).hexdigest(),
             }
@@ -687,10 +825,34 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("images", type=Path, help="Folder containing original Sony JPEGs")
     parser.add_argument("output", type=Path, help="Empty output folder for tagged copies")
     parser.add_argument("--match", choices=("auto", "time", "order"), default="auto")
+    parser.add_argument(
+        "--attitude-source",
+        choices=("body", "camera_capture"),
+        default="body",
+        help="Use interpolated vehicle body attitude (default) or camera_capture.q",
+    )
     parser.add_argument("--tolerance", type=float, default=2.0, help="Timestamp tolerance in seconds")
     parser.add_argument("--mount-roll", type=float, default=0.0, help="Camera mount roll offset, degrees")
     parser.add_argument("--mount-pitch", type=float, default=0.0, help="Camera mount pitch offset, degrees")
     parser.add_argument("--mount-yaw", type=float, default=0.0, help="Camera mount yaw offset, degrees")
+    parser.add_argument(
+        "--camera-facing",
+        type=float,
+        default=0.0,
+        help="Camera facing clockwise from aircraft nose, degrees (0 forward, 90 right)",
+    )
+    parser.add_argument(
+        "--camera-down-angle",
+        type=float,
+        default=90.0,
+        help="Optical-axis angle below the body horizon, degrees (90 is nadir)",
+    )
+    parser.add_argument(
+        "--image-rotation",
+        type=float,
+        default=0.0,
+        help="Physical image rotation clockwise from landscape, degrees",
+    )
     parser.add_argument("--overwrite", action="store_true", help="Replace same-named files in output")
     return parser
 

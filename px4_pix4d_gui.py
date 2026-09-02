@@ -22,7 +22,7 @@ import px4_pix4d_tagger as engine
 
 
 APP_TITLE = "PX4 → Pix4D Image Tagger"
-APP_VERSION = "Verification build 0.3"
+APP_VERSION = "Verification build 0.4"
 
 # GitHub-dark-inspired palette. These are explicit rather than OS theme colors
 # so the student interface is consistent on Windows, macOS, and Linux.
@@ -42,6 +42,24 @@ RED = "#f85149"
 YELLOW = "#d29922"
 LOG_BG = "#010409"
 
+FACING_CHOICES = {
+    "Forward / nose (0°)": 0.0,
+    "Right wing (90°)": 90.0,
+    "Rear / tail (180°)": 180.0,
+    "Left wing (270°)": 270.0,
+    "Custom angle": None,
+}
+ATTITUDE_SOURCE_CHOICES = {
+    "Aircraft body — fixed camera (recommended)": "body",
+    "Logged camera/gimbal — use camera_capture.q": "camera_capture",
+}
+LAYOUT_CHOICES = {
+    "Landscape — top edge toward camera facing": 0.0,
+    "Portrait clockwise — top edge toward camera right": 90.0,
+    "Landscape inverted — top edge opposite camera facing": 180.0,
+    "Portrait counter-clockwise — top edge toward camera left": 270.0,
+}
+
 
 def application_directory() -> Path:
     if getattr(sys, "frozen", False):
@@ -56,6 +74,10 @@ def load_course_config() -> dict:
         "mount_yaw_deg": 0.0,
         "match_method": "auto",
         "timestamp_tolerance_s": 2.0,
+        "camera_facing_deg": 0.0,
+        "camera_down_angle_deg": 90.0,
+        "image_rotation_deg": 0.0,
+        "attitude_source": "body",
     }
     path = application_directory() / "course_config.json"
     if not path.exists():
@@ -108,6 +130,17 @@ class TaggerApp:
         self.images_var = StringVar()
         self.output_var = StringVar()
         self.overwrite_var = BooleanVar(value=False)
+        source_name = next(
+            (name for name, value in ATTITUDE_SOURCE_CHOICES.items() if value == self.config["attitude_source"]),
+            next(iter(ATTITUDE_SOURCE_CHOICES)),
+        )
+        self.attitude_source_var = StringVar(value=source_name)
+        self.facing_choice_var = StringVar(value="Forward / nose (0°)")
+        self.facing_deg_var = StringVar(value=f'{float(self.config["camera_facing_deg"]):g}')
+        self.down_angle_var = StringVar(value=f'{float(self.config["camera_down_angle_deg"]):g}')
+        configured_rotation = float(self.config["image_rotation_deg"]) % 360.0
+        layout = next((name for name, value in LAYOUT_CHOICES.items() if value == configured_rotation), next(iter(LAYOUT_CHOICES)))
+        self.layout_var = StringVar(value=layout)
         self.status_var = StringVar(value="Ready — select one flight log and its original-image folder.")
         self.progress_detail_var = StringVar(value="Waiting for a flight dataset")
         self._build()
@@ -154,7 +187,14 @@ class TaggerApp:
             font=("Helvetica Neue", 11),
         ).pack(anchor="w", pady=(5, 18))
 
-        setup_border, setup = self._card(outer)
+        notebook = ttk.Notebook(outer, style="Dark.TNotebook")
+        notebook.pack(fill=X)
+        flight_tab = Frame(notebook, bg=BG)
+        orientation_tab = Frame(notebook, bg=BG)
+        notebook.add(flight_tab, text="  FLIGHT DATA  ")
+        notebook.add(orientation_tab, text="  ORIENTATION  ")
+
+        setup_border, setup = self._card(flight_tab)
         setup_border.pack(fill=X)
         Label(setup, text="FLIGHT DATA", bg=SURFACE, fg=MUTED, font=("Helvetica Neue", 9, "bold")).pack(anchor="w")
         self._path_row(setup, "1  PX4 flight log", ".ulg flight record", self.log_var, self._browse_log)
@@ -175,6 +215,76 @@ class TaggerApp:
             font=("Helvetica Neue", 10),
             highlightthickness=0,
         ).pack(anchor="w")
+
+        orientation_border, orientation = self._card(orientation_tab)
+        orientation_border.pack(fill=X)
+        Label(
+            orientation,
+            text="FIXED CAMERA MOUNT",
+            bg=SURFACE,
+            fg=MUTED,
+            font=("Helvetica Neue", 9, "bold"),
+        ).pack(anchor="w")
+        Label(
+            orientation,
+            text=(
+                "Describe the camera relative to the aircraft body. The tool combines this fixed mount "
+                "with the PX4 body-attitude quaternion for every exposure."
+            ),
+            bg=SURFACE,
+            fg=MUTED,
+            justify=LEFT,
+            wraplength=850,
+            font=("Helvetica Neue", 10),
+        ).pack(anchor="w", pady=(5, 12))
+        self._orientation_combo(
+            orientation,
+            "Attitude source",
+            "Use aircraft body data for a fixed mount",
+            self.attitude_source_var,
+            tuple(ATTITUDE_SOURCE_CHOICES),
+        )
+        self._orientation_combo(
+            orientation,
+            "Camera faces",
+            "Direction around the aircraft body",
+            self.facing_choice_var,
+            tuple(FACING_CHOICES),
+            self._facing_selected,
+        )
+        self._orientation_entry(
+            orientation,
+            "Facing angle from nose",
+            "Degrees clockwise: 0 forward, 90 right, 180 rear, 270 left",
+            self.facing_deg_var,
+        )
+        self._orientation_entry(
+            orientation,
+            "Downward angle",
+            "Degrees below body horizon: 0 forward-looking, 90 straight down (nadir)",
+            self.down_angle_var,
+        )
+        self._orientation_combo(
+            orientation,
+            "Photo layout",
+            "Physical rotation of the camera body",
+            self.layout_var,
+            tuple(LAYOUT_CHOICES),
+        )
+        Label(
+            orientation,
+            text=(
+                "Important: DJI gimbal pitch often reports nadir as −90°. Pix4D Camera.Pitch uses 0° "
+                "for nadir. This tool performs the 3-D conversion; it does not copy or simply add those angles."
+            ),
+            bg=SURFACE_2,
+            fg=YELLOW,
+            justify=LEFT,
+            wraplength=830,
+            padx=12,
+            pady=9,
+            font=("Helvetica Neue", 9),
+        ).pack(fill=X, pady=(14, 0))
 
         action_row = Frame(outer, bg=BG)
         action_row.pack(fill=X, pady=14)
@@ -239,16 +349,11 @@ class TaggerApp:
         self.log_text.tag_configure("warning", foreground=YELLOW)
         self.log_text.tag_configure("error", foreground=RED)
 
-        mount = (
-            float(self.config["mount_roll_deg"]),
-            float(self.config["mount_pitch_deg"]),
-            float(self.config["mount_yaw_deg"]),
-        )
         footer = Frame(outer, bg=BG)
         footer.pack(fill=X, pady=(10, 0))
         Label(
             footer,
-            text=f"Mount offsets  R {mount[0]:g}°  •  P {mount[1]:g}°  •  Y {mount[2]:g}°",
+            text="Orientation is calculated from PX4 body attitude + fixed camera mount",
             bg=BG,
             fg=SUBTLE,
             font=("Menlo", 9),
@@ -309,6 +414,52 @@ class TaggerApp:
         entry.pack(side=LEFT, fill=X, expand=True, ipady=8)
         browse = self._button(input_row, "Browse…", command)
         browse.pack(side=RIGHT, padx=(8, 0))
+
+    def _orientation_entry(self, parent, label: str, hint: str, variable: StringVar) -> None:
+        row = Frame(parent, bg=SURFACE)
+        row.pack(fill=X, pady=(9, 0))
+        Label(row, text=label, bg=SURFACE, fg=TEXT, width=24, anchor="w", font=("Helvetica Neue", 10, "bold")).pack(side=LEFT)
+        Entry(
+            row,
+            textvariable=variable,
+            width=12,
+            bg=INPUT_BG,
+            fg=TEXT,
+            insertbackground=TEXT,
+            relief="flat",
+            highlightthickness=1,
+            highlightbackground=BORDER,
+            highlightcolor=BLUE,
+            font=("Menlo", 10),
+        ).pack(side=LEFT, ipady=6, padx=(8, 12))
+        Label(row, text=hint, bg=SURFACE, fg=SUBTLE, anchor="w", font=("Helvetica Neue", 9)).pack(side=LEFT)
+
+    def _orientation_combo(self, parent, label: str, hint: str, variable: StringVar, values, callback=None) -> None:
+        row = Frame(parent, bg=SURFACE)
+        row.pack(fill=X, pady=(9, 0))
+        Label(row, text=label, bg=SURFACE, fg=TEXT, width=24, anchor="w", font=("Helvetica Neue", 10, "bold")).pack(side=LEFT)
+        combo = ttk.Combobox(row, textvariable=variable, values=values, state="readonly", width=47)
+        combo.pack(side=LEFT, ipady=4, padx=(8, 12))
+        if callback:
+            combo.bind("<<ComboboxSelected>>", callback)
+        Label(row, text=hint, bg=SURFACE, fg=SUBTLE, anchor="w", font=("Helvetica Neue", 9)).pack(side=LEFT)
+
+    def _facing_selected(self, _event=None) -> None:
+        value = FACING_CHOICES.get(self.facing_choice_var.get())
+        if value is not None:
+            self.facing_deg_var.set(f"{value:g}")
+
+    def _orientation_values(self) -> tuple[str, float, float, float]:
+        try:
+            facing = float(self.facing_deg_var.get())
+            down = float(self.down_angle_var.get())
+        except ValueError as exc:
+            raise ValueError("Facing angle and downward angle must be numbers.") from exc
+        if not -90.0 <= down <= 90.0:
+            raise ValueError("Downward angle must be between -90° and 90°.")
+        rotation = LAYOUT_CHOICES[self.layout_var.get()]
+        source = ATTITUDE_SOURCE_CHOICES[self.attitude_source_var.get()]
+        return source, facing, down, rotation
 
     def _browse_log(self) -> None:
         selected = filedialog.askopenfilename(title="Select PX4 flight log", filetypes=[("PX4 ULog", "*.ulg"), ("All files", "*.*")])
@@ -382,6 +533,11 @@ class TaggerApp:
             messagebox.showerror(APP_TITLE, "Select an output folder.")
             return
         output = Path(output_text)
+        try:
+            attitude_source, camera_facing, camera_down_angle, image_rotation = self._orientation_values()
+        except (ValueError, KeyError) as exc:
+            messagebox.showerror(APP_TITLE, str(exc))
+            return
         jpeg_count = sum(1 for p in images.iterdir() if p.is_file() and p.suffix.lower() in {".jpg", ".jpeg"})
         if jpeg_count == 0:
             messagebox.showerror(APP_TITLE, "The original-image folder contains no JPEG files.")
@@ -408,10 +564,14 @@ class TaggerApp:
             images=images,
             output=output,
             match=str(self.config["match_method"]),
+            attitude_source=attitude_source,
             tolerance=float(self.config["timestamp_tolerance_s"]),
             mount_roll=float(self.config["mount_roll_deg"]),
             mount_pitch=float(self.config["mount_pitch_deg"]),
             mount_yaw=float(self.config["mount_yaw_deg"]),
+            camera_facing=camera_facing,
+            camera_down_angle=camera_down_angle,
+            image_rotation=image_rotation,
             overwrite=bool(self.overwrite_var.get()),
             progress_callback=self._queue_progress,
         )
@@ -505,6 +665,19 @@ def main() -> None:
             lightcolor=BLUE,
             darkcolor=BLUE,
             thickness=9,
+        )
+        style.configure("Dark.TNotebook", background=BG, borderwidth=0)
+        style.configure(
+            "Dark.TNotebook.Tab",
+            background=SURFACE_2,
+            foreground=MUTED,
+            padding=(16, 8),
+            borderwidth=0,
+        )
+        style.map(
+            "Dark.TNotebook.Tab",
+            background=[("selected", SURFACE)],
+            foreground=[("selected", TEXT)],
         )
     except Exception:
         pass

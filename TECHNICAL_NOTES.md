@@ -6,9 +6,9 @@ QGroundControl's geotagger currently reads PX4 capture events but writes only
 the standard EXIF GPS version, latitude, longitude, altitude, and reference
 fields. Its EXIF writer does not write camera attitude. PX4's `camera_capture`
 topic already includes a quaternion (`q`) and documents it as camera attitude
-when a gimbal is used, or vehicle attitude otherwise. The tool therefore uses
-that capture record directly instead of trying to synchronize a lower-level raw
-IMU stream after the flight.
+when a gimbal is used, or vehicle attitude otherwise. Version 0.4 lets the user
+choose that logged camera/gimbal attitude or the aircraft's `vehicle_attitude`
+topic explicitly. The aircraft-body option is the default for fixed mounts.
 
 - QGC geotag writer:
   https://api.qgroundcontrol.com/master/ExifParser_8cc_source.html
@@ -39,7 +39,7 @@ model information, or an import/project-state issue.
 - Pix4D conversion note:
   https://data.pix4d.com/misc/KB/documents/Pix4D_Yaw_Pitch_Roll_Omega_to_Phi_Kappa_angles_and_conversion.pdf
 
-## Rigid-mount rotation
+## Fixed-mount rotation
 
 PX4's vehicle attitude quaternion maps its FRD body frame to local NED. Pix4D's
 documented perpendicular-camera relation is:
@@ -52,9 +52,23 @@ body_from_image = [[0, 1,  0],
 
 This means image right is aircraft right, image top is aircraft forward, and
 camera back is aircraft up. With that physical mounting, Pix4D's YPR input is
-exactly PX4 vehicle YPR. For a measured nonzero camera mount offset, the tool
-composes the body attitude, actual mount rotation, and inverse Pix4D nominal
-mount before extracting Z-Y-X yaw, pitch, and roll.
+exactly PX4 vehicle YPR.
+
+For the aircraft-body option, the tool interpolates `vehicle_attitude.q` with
+quaternion spherical linear interpolation at every `camera_capture.timestamp`.
+The physical mount is described by a facing angle clockwise from the aircraft
+nose, an optical-axis angle below the body horizon (90 degrees is nadir), and an
+image rotation around the optical axis (landscape or either portrait side).
+
+The program constructs orthonormal image-right, image-top, and camera-back
+vectors in the PX4 body frame, composes that matrix with the body-to-NED
+quaternion, and only then converts the camera frame to Pix4D yaw/pitch/roll. It
+does not simply add 90 degrees to an Euler pitch value.
+
+That distinction is important when comparing DJI metadata. DJI images commonly
+report a nadir gimbal pitch near -90 degrees, while Pix4D's documented
+`Xmp.Camera.Pitch` convention defines 0 degrees as nadir and 90 degrees as
+forward-looking. The output uses Pix4D's convention.
 
 ## Capture-time accuracy
 
