@@ -1,0 +1,707 @@
+#!/usr/bin/env python3
+"""Create Pix4D-ready JPEG copies from PX4 camera-capture logs.
+
+The program preserves the JPEG scan data, adds/replaces standard EXIF GPS
+metadata, and adds Pix4D's XMP Camera yaw/pitch/roll tags. Source files are
+never modified.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import hashlib
+import math
+import os
+import shutil
+import sys
+import tempfile
+from dataclasses import dataclass
+from datetime import datetime
+from io import BytesIO
+from pathlib import Path
+from typing import Iterable, Sequence
+
+import numpy as np
+from lxml import etree
+from PIL import ExifTags, Image, TiffImagePlugin
+from pyulog import ULog
+from scipy.spatial.transform import Rotation
+
+
+XMP_HEADER = b"http://ns.adobe.com/xap/1.0/\x00"
+XMP_NS = "adobe:ns:meta/"
+RDF_NS = "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+CAMERA_NS = "http://pix4d.com/camera/1.0"
+
+# Columns are Pix4D image axes expressed in the PX4 FRD body frame:
+# image right -> body right, image top -> body forward, camera back -> body up.
+PIX4D_DEFAULT_BODY_FROM_IMAGE = np.array(
+    [[0.0, 1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, -1.0]], dtype=float
+)
+
+
+class TaggerError(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True)
+class Capture:
+    index: int
+    sequence: int
+    time_s: float
+    latitude: float
+    longitude: float
+    altitude_m: float
+    ground_distance_m: float | None
+    quaternion_wxyz: tuple[float, float, float, float]
+    result: int
+
+
+@dataclass(frozen=True)
+class ImageRecord:
+    path: Path
+    time_s: float | None
+
+
+@dataclass(frozen=True)
+class Match:
+    image: ImageRecord
+    capture: Capture
+    time_error_s: float | None
+
+
+def _first(data: dict, *names: str):
+    for name in names:
+        if name in data:
+            return data[name]
+    raise TaggerError(f"ULog field missing; tried: {', '.join(names)}")
+
+
+def load_captures(log_path: Path) -> list[Capture]:
+    """Read valid camera_capture records from a PX4 ULog."""
+    try:
+        ulog = ULog(str(log_path), message_name_filter_list=["camera_capture"])
+    except Exception as exc:
+        raise TaggerError(f"Could not read PX4 log {log_path}: {exc}") from exc
+
+    datasets = [d for d in ulog.data_list if d.name == "camera_capture"]
+    if not datasets:
+        raise TaggerError(
+            "No camera_capture topic is present in this ULog. Confirm PX4 camera "
+            "capture feedback/logging was enabled for the flight."
+        )
+
+    captures: list[Capture] = []
+    raw_index = 0
+    for dataset in datasets:
+        d = dataset.data
+        count = len(_first(d, "timestamp"))
+        timestamp = _first(d, "timestamp").astype(np.float64) / 1_000_000.0
+        timestamp_utc_raw = d.get("timestamp_utc")
+        timestamp_utc = (
+            timestamp_utc_raw.astype(np.float64) / 1_000_000.0
+            if timestamp_utc_raw is not None
+            else np.zeros(count)
+        )
+        seq = d.get("seq", np.arange(count))
+        lat = _first(d, "lat")
+        lon = _first(d, "lon")
+        alt = _first(d, "alt")
+        ground = d.get("ground_distance")
+        result = d.get("result", np.full(count, -1))
+        q_fields = [
+            _first(d, f"q[{axis}]", f"q_{axis}") for axis in range(4)
+        ]
+
+        for i in range(count):
+            # PX4: 0 explicitly means capture failed; -1 means no feedback.
+            if int(result[i]) == 0:
+                raw_index += 1
+                continue
+            la, lo, al = float(lat[i]), float(lon[i]), float(alt[i])
+            q = tuple(float(q_fields[j][i]) for j in range(4))
+            if not (
+                math.isfinite(la)
+                and math.isfinite(lo)
+                and math.isfinite(al)
+                and -90 <= la <= 90
+                and -180 <= lo <= 180
+                and all(math.isfinite(v) for v in q)
+                and np.linalg.norm(q) > 0.5
+            ):
+                raw_index += 1
+                continue
+            utc = float(timestamp_utc[i])
+            event_time = utc if utc > 1_000_000_000 else float(timestamp[i])
+            gd = float(ground[i]) if ground is not None else math.nan
+            captures.append(
+                Capture(
+                    index=raw_index,
+                    sequence=int(seq[i]),
+                    time_s=event_time,
+                    latitude=la,
+                    longitude=lo,
+                    altitude_m=al,
+                    ground_distance_m=gd if math.isfinite(gd) and gd >= 0 else None,
+                    quaternion_wxyz=q,
+                    result=int(result[i]),
+                )
+            )
+            raw_index += 1
+
+    captures.sort(key=lambda c: (c.time_s, c.sequence, c.index))
+    if not captures:
+        raise TaggerError("The camera_capture topic contains no valid capture records.")
+    return captures
+
+
+def _parse_exif_datetime(exif: Image.Exif) -> float | None:
+    candidates = [
+        (36867, 37521, 36881),  # DateTimeOriginal, SubSecTimeOriginal, OffsetTimeOriginal
+        (36868, 37522, 36882),  # DateTimeDigitized
+        (306, 37520, 36880),    # DateTime
+    ]
+    for date_tag, subsec_tag, offset_tag in candidates:
+        raw = exif.get(date_tag)
+        if not raw:
+            continue
+        if isinstance(raw, bytes):
+            raw = raw.decode("ascii", "ignore")
+        try:
+            dt = datetime.strptime(str(raw).strip("\x00"), "%Y:%m:%d %H:%M:%S")
+        except ValueError:
+            continue
+        fraction = 0.0
+        subsec = exif.get(subsec_tag)
+        if subsec is not None:
+            if isinstance(subsec, bytes):
+                subsec = subsec.decode("ascii", "ignore")
+            digits = "".join(ch for ch in str(subsec) if ch.isdigit())
+            if digits:
+                fraction = float(f"0.{digits}")
+        # The matching algorithm estimates a constant clock offset. Keeping a
+        # naive local timestamp is intentional and handles missing time zones.
+        return dt.timestamp() + fraction
+    return None
+
+
+def load_images(image_dir: Path) -> list[ImageRecord]:
+    extensions = {".jpg", ".jpeg"}
+    paths = sorted(
+        (p for p in image_dir.iterdir() if p.is_file() and p.suffix.lower() in extensions),
+        key=lambda p: p.name.lower(),
+    )
+    if not paths:
+        raise TaggerError(f"No JPEG images found in {image_dir}")
+    records: list[ImageRecord] = []
+    for path in paths:
+        try:
+            with Image.open(path) as image:
+                if image.format != "JPEG":
+                    continue
+                records.append(ImageRecord(path=path, time_s=_parse_exif_datetime(image.getexif())))
+        except Exception as exc:
+            raise TaggerError(f"Cannot read JPEG metadata from {path.name}: {exc}") from exc
+    return records
+
+
+def _monotonic_nearest_matches(
+    images: Sequence[ImageRecord],
+    captures: Sequence[Capture],
+    offset_s: float,
+    tolerance_s: float,
+) -> list[Match]:
+    timed_images = [(i, rec) for i, rec in enumerate(images) if rec.time_s is not None]
+    out: list[Match] = []
+    next_capture = 0
+    for _, image in timed_images:
+        target = float(image.time_s) - offset_s
+        while (
+            next_capture + 1 < len(captures)
+            and abs(captures[next_capture + 1].time_s - target)
+            <= abs(captures[next_capture].time_s - target)
+        ):
+            next_capture += 1
+        if next_capture >= len(captures):
+            break
+        error = float(image.time_s) - (captures[next_capture].time_s + offset_s)
+        if abs(error) <= tolerance_s:
+            out.append(Match(image, captures[next_capture], error))
+            next_capture += 1
+    return out
+
+
+def match_by_time(
+    images: Sequence[ImageRecord], captures: Sequence[Capture], tolerance_s: float
+) -> tuple[list[Match], float]:
+    if any(image.time_s is None for image in images):
+        raise TaggerError("One or more JPEGs have no usable EXIF capture timestamp.")
+
+    images = sorted(images, key=lambda rec: (float(rec.time_s), rec.path.name.lower()))
+
+    # Try every plausible constant index shift. For each, estimate the camera
+    # clock offset by the median and score monotonic nearest-neighbor matches.
+    best: tuple[int, float, float, list[Match]] | None = None
+    n, m = len(images), len(captures)
+    for shift in range(-(m - 1), n):
+        diffs: list[float] = []
+        for image_index in range(max(0, shift), min(n, m + shift)):
+            capture_index = image_index - shift
+            diffs.append(float(images[image_index].time_s) - captures[capture_index].time_s)
+        if not diffs:
+            continue
+        offset = float(np.median(diffs))
+        matches = _monotonic_nearest_matches(images, captures, offset, tolerance_s)
+        rmse = (
+            math.sqrt(sum(float(x.time_error_s) ** 2 for x in matches) / len(matches))
+            if matches
+            else math.inf
+        )
+        score = (len(matches), -rmse, -abs(shift))
+        if best is None or score > (best[0], -best[1], -best[2]):
+            best = (len(matches), rmse, abs(shift), matches)
+    if best is None or not best[3]:
+        raise TaggerError("No timestamp matches were found between JPEGs and camera captures.")
+    matches = best[3]
+    offsets = [float(x.image.time_s) - x.capture.time_s for x in matches]
+    return matches, float(np.median(offsets))
+
+
+def match_by_order(images: Sequence[ImageRecord], captures: Sequence[Capture]) -> list[Match]:
+    if len(images) != len(captures):
+        raise TaggerError(
+            f"Order matching requires equal counts; found {len(images)} images and "
+            f"{len(captures)} capture records."
+        )
+    ordered_images = sorted(
+        images,
+        key=lambda rec: (rec.time_s is None, rec.time_s if rec.time_s is not None else 0, rec.path.name),
+    )
+    return [Match(image, capture, None) for image, capture in zip(ordered_images, captures)]
+
+
+def match_images(
+    images: Sequence[ImageRecord],
+    captures: Sequence[Capture],
+    method: str,
+    tolerance_s: float,
+) -> tuple[list[Match], float | None]:
+    if method == "order":
+        return match_by_order(images, captures), None
+    if method == "time":
+        return match_by_time(images, captures, tolerance_s)
+    # auto: prefer time matching, but use order when timestamps are unavailable
+    # and the counts give an unambiguous one-to-one mapping.
+    if all(image.time_s is not None for image in images):
+        matches, offset = match_by_time(images, captures, tolerance_s)
+        if len(matches) == len(images):
+            return matches, offset
+    if len(images) == len(captures):
+        return match_by_order(images, captures), None
+    raise TaggerError(
+        "Automatic matching could not match every image. Correct the camera clock/tolerance, "
+        "remove unrelated images, or use --match order when counts are equal."
+    )
+
+
+def rotation_matrix_xyz(roll_deg: float, pitch_deg: float, yaw_deg: float) -> np.ndarray:
+    """Return Rz(yaw) Ry(pitch) Rx(roll)."""
+    return Rotation.from_euler("ZYX", [yaw_deg, pitch_deg, roll_deg], degrees=True).as_matrix()
+
+
+def pix4d_ypr(
+    quaternion_wxyz: Sequence[float],
+    mount_roll_deg: float = 0,
+    mount_pitch_deg: float = 0,
+    mount_yaw_deg: float = 0,
+) -> tuple[float, float, float]:
+    """Convert PX4 body attitude plus rigid camera mount to Pix4D Y/P/R.
+
+    Mount offsets are intrinsic rotations about the nominal Pix4D image frame.
+    Zero is a nadir camera with image top toward vehicle front.
+    """
+    w, x, y, z = quaternion_wxyz
+    body_to_ned = Rotation.from_quat([x, y, z, w]).as_matrix()
+    mount_adjustment = rotation_matrix_xyz(mount_roll_deg, mount_pitch_deg, mount_yaw_deg)
+    body_from_image = PIX4D_DEFAULT_BODY_FROM_IMAGE @ mount_adjustment
+    image_to_ned = body_to_ned @ body_from_image
+    equivalent_body_to_ned = image_to_ned @ PIX4D_DEFAULT_BODY_FROM_IMAGE.T
+    yaw, pitch, roll = Rotation.from_matrix(equivalent_body_to_ned).as_euler(
+        "ZYX", degrees=True
+    )
+    return float(yaw % 360.0), float(pitch), float(roll)
+
+
+def _to_dms_rationals(value: float):
+    absolute = abs(value)
+    degrees = int(absolute)
+    minutes_full = (absolute - degrees) * 60.0
+    minutes = int(minutes_full)
+    seconds = (minutes_full - minutes) * 60.0
+    rational = TiffImagePlugin.IFDRational
+    return (rational(degrees, 1), rational(minutes, 1), rational(round(seconds * 1_000_000), 1_000_000))
+
+
+def build_exif(jpeg: bytes, capture: Capture) -> bytes:
+    with Image.open(BytesIO(jpeg)) as image:
+        exif = image.getexif()
+    gps = dict(exif.get_ifd(ExifTags.IFD.GPSInfo))
+    gps[0] = b"\x02\x03\x00\x00"  # GPSVersionID
+    gps[1] = "N" if capture.latitude >= 0 else "S"
+    gps[2] = _to_dms_rationals(capture.latitude)
+    gps[3] = "E" if capture.longitude >= 0 else "W"
+    gps[4] = _to_dms_rationals(capture.longitude)
+    gps[5] = 0 if capture.altitude_m >= 0 else 1
+    gps[6] = TiffImagePlugin.IFDRational(round(abs(capture.altitude_m) * 1000), 1000)
+    exif[ExifTags.IFD.GPSInfo] = gps
+    return exif.tobytes()
+
+
+def _new_xmp_root():
+    root = etree.Element(f"{{{XMP_NS}}}xmpmeta", nsmap={"x": XMP_NS})
+    rdf = etree.SubElement(root, f"{{{RDF_NS}}}RDF", nsmap={"rdf": RDF_NS})
+    etree.SubElement(
+        rdf,
+        f"{{{RDF_NS}}}Description",
+        nsmap={"Camera": CAMERA_NS},
+        attrib={f"{{{RDF_NS}}}about": ""},
+    )
+    return root
+
+
+def build_xmp(existing_payload: bytes | None, capture: Capture, ypr: Sequence[float]) -> bytes:
+    root = None
+    if existing_payload:
+        try:
+            parser = etree.XMLParser(resolve_entities=False, remove_blank_text=False, recover=False)
+            root = etree.fromstring(existing_payload, parser=parser)
+        except etree.XMLSyntaxError:
+            root = None
+    if root is None:
+        root = _new_xmp_root()
+    descriptions = root.xpath("//*[local-name()='Description' and namespace-uri()=$rdf]", rdf=RDF_NS)
+    if descriptions:
+        description = descriptions[0]
+    else:
+        rdf_nodes = root.xpath("//*[local-name()='RDF' and namespace-uri()=$rdf]", rdf=RDF_NS)
+        if not rdf_nodes:
+            root = _new_xmp_root()
+            description = root.xpath("//*[local-name()='Description']")[0]
+        else:
+            description = etree.SubElement(rdf_nodes[0], f"{{{RDF_NS}}}Description")
+
+    yaw, pitch, roll = ypr
+    tags = {
+        "Yaw": f"{yaw:.8f}",
+        "Pitch": f"{pitch:.8f}",
+        "Roll": f"{roll:.8f}",
+        "HorizCS": "EPSG:4326",
+    }
+    if capture.ground_distance_m is not None:
+        tags["AboveGroundAltitude"] = f"{capture.ground_distance_m:.3f}"
+    for key, value in tags.items():
+        description.set(f"{{{CAMERA_NS}}}{key}", value)
+
+    xml = etree.tostring(root, encoding="utf-8", xml_declaration=False, pretty_print=False)
+    packet = (
+        b'<?xpacket begin="\xef\xbb\xbf" id="W5M0MpCehiHzreSzNTczkc9d"?>\n'
+        + xml
+        + b'\n<?xpacket end="w"?>'
+    )
+    return XMP_HEADER + packet
+
+
+def _jpeg_segments(jpeg: bytes):
+    if not jpeg.startswith(b"\xff\xd8"):
+        raise TaggerError("Input is not a JPEG file")
+    pos = 2
+    while pos < len(jpeg):
+        if jpeg[pos] != 0xFF:
+            raise TaggerError("Malformed JPEG marker stream")
+        marker_start = pos
+        while pos < len(jpeg) and jpeg[pos] == 0xFF:
+            pos += 1
+        marker = jpeg[pos]
+        pos += 1
+        if marker == 0xDA:  # Start of scan; the remainder is entropy-coded data.
+            yield marker, marker_start, len(jpeg), jpeg[marker_start:]
+            return
+        if marker in (0xD8, 0xD9) or 0xD0 <= marker <= 0xD7:
+            yield marker, marker_start, pos, jpeg[marker_start:pos]
+            continue
+        if pos + 2 > len(jpeg):
+            raise TaggerError("Truncated JPEG segment")
+        length = int.from_bytes(jpeg[pos : pos + 2], "big")
+        end = pos + length
+        if length < 2 or end > len(jpeg):
+            raise TaggerError("Invalid JPEG segment length")
+        yield marker, marker_start, end, jpeg[marker_start:end]
+        pos = end
+    raise TaggerError("JPEG has no start-of-scan marker")
+
+
+def _app1(payload: bytes) -> bytes:
+    length = len(payload) + 2
+    if length > 65535:
+        raise TaggerError("Metadata block is too large for a JPEG APP1 segment")
+    return b"\xff\xe1" + length.to_bytes(2, "big") + payload
+
+
+def jpeg_scan_bytes(jpeg: bytes) -> bytes:
+    for marker, _, _, segment in _jpeg_segments(jpeg):
+        if marker == 0xDA:
+            return segment
+    raise TaggerError("JPEG scan data not found")
+
+
+def write_metadata(jpeg: bytes, capture: Capture, ypr: Sequence[float]) -> bytes:
+    segments = list(_jpeg_segments(jpeg))
+    existing_xmp: bytes | None = None
+    for marker, _, _, segment in segments:
+        if marker == 0xE1:
+            payload = segment[4:]
+            if payload.startswith(XMP_HEADER):
+                existing_xmp = payload[len(XMP_HEADER) :]
+                break
+    exif_segment = _app1(build_exif(jpeg, capture))
+    xmp_segment = _app1(build_xmp(existing_xmp, capture, ypr))
+
+    output = bytearray(b"\xff\xd8")
+    inserted = False
+    for marker, _, _, segment in segments:
+        if marker == 0xDA:
+            if not inserted:
+                output += exif_segment + xmp_segment
+            output += segment
+            break
+        payload = segment[4:] if marker == 0xE1 else b""
+        if marker == 0xE1 and (payload.startswith(b"Exif\x00\x00") or payload.startswith(XMP_HEADER)):
+            if not inserted:
+                output += exif_segment + xmp_segment
+                inserted = True
+            continue
+        output += segment
+    return bytes(output)
+
+
+def _gps_decimal(gps: dict, coord_tag: int, ref_tag: int) -> float:
+    d, m, s = (float(x) for x in gps[coord_tag])
+    value = d + m / 60 + s / 3600
+    ref = gps[ref_tag]
+    if isinstance(ref, bytes):
+        ref = ref.decode("ascii", "ignore")
+    return -value if str(ref).upper() in {"S", "W"} else value
+
+
+def verify_output(source: bytes, tagged: bytes, capture: Capture, expected_ypr: Sequence[float]) -> None:
+    if hashlib.sha256(jpeg_scan_bytes(source)).digest() != hashlib.sha256(jpeg_scan_bytes(tagged)).digest():
+        raise TaggerError("JPEG scan data changed; refusing output")
+    with Image.open(BytesIO(tagged)) as image:
+        gps = image.getexif().get_ifd(ExifTags.IFD.GPSInfo)
+    lat = _gps_decimal(gps, 2, 1)
+    lon = _gps_decimal(gps, 4, 3)
+    alt_ref = gps.get(5, 0)
+    if isinstance(alt_ref, bytes):
+        alt_ref = alt_ref[0] if alt_ref else 0
+    alt = float(gps[6]) * (-1 if int(alt_ref) == 1 else 1)
+    if abs(lat - capture.latitude) > 1e-7 or abs(lon - capture.longitude) > 1e-7:
+        raise TaggerError("EXIF GPS coordinate verification failed")
+    if abs(alt - capture.altitude_m) > 0.01:
+        raise TaggerError("EXIF GPS altitude verification failed")
+
+    xmp_payload = None
+    for marker, _, _, segment in _jpeg_segments(tagged):
+        if marker == 0xE1 and segment[4:].startswith(XMP_HEADER):
+            xmp_payload = segment[4 + len(XMP_HEADER) :]
+            break
+    if xmp_payload is None:
+        raise TaggerError("Pix4D XMP block verification failed")
+    root = etree.fromstring(xmp_payload, parser=etree.XMLParser(recover=False))
+    descriptions = root.xpath("//*[local-name()='Description']")
+    if not descriptions:
+        raise TaggerError("Pix4D XMP description is missing")
+    desc = descriptions[0]
+    actual = [float(desc.get(f"{{{CAMERA_NS}}}{key}")) for key in ("Yaw", "Pitch", "Roll")]
+    if max(abs(a - b) for a, b in zip(actual, expected_ypr)) > 1e-5:
+        raise TaggerError("Pix4D XMP orientation verification failed")
+
+
+def _notify_progress(
+    args: argparse.Namespace,
+    current: int,
+    total: int,
+    image_name: str,
+    stage: str,
+) -> None:
+    """Notify the optional GUI without coupling the command-line engine to Tk."""
+    callback = getattr(args, "progress_callback", None)
+    if callable(callback):
+        callback(current, total, image_name, stage)
+
+
+def process(args: argparse.Namespace) -> int:
+    log_path = args.log.resolve()
+    image_dir = args.images.resolve()
+    output_dir = args.output.resolve()
+    if not log_path.is_file():
+        raise TaggerError(f"Log file not found: {log_path}")
+    if not image_dir.is_dir():
+        raise TaggerError(f"Image directory not found: {image_dir}")
+    if output_dir == image_dir or image_dir in output_dir.parents:
+        raise TaggerError("Output directory must not be the source image directory or inside it")
+    if output_dir.exists() and any(output_dir.iterdir()) and not args.overwrite:
+        raise TaggerError("Output directory is not empty; use --overwrite or select an empty folder")
+
+    print("=== PX4 → Pix4D IMAGE-TAGGING SESSION ===")
+    print(f"Flight log:       {log_path}")
+    print(f"Original JPEGs:   {image_dir}")
+    print(f"Tagged output:    {output_dir}")
+    print(f"Match method:     {args.match} (tolerance {args.tolerance:.3f} s)")
+    print(
+        "Camera mount:     "
+        f"roll {args.mount_roll:.3f}°, pitch {args.mount_pitch:.3f}°, yaw {args.mount_yaw:.3f}°"
+    )
+    print(f"Existing outputs: {'replace when names match' if args.overwrite else 'must be empty'}")
+    print()
+
+    _notify_progress(args, 0, 0, image_dir.name, "Discovering source JPEGs…")
+    print("STEP 1/5 — Discover source JPEGs")
+    images = load_images(image_dir)
+    timestamped = sum(image.time_s is not None for image in images)
+    print(f"  Found {len(images)} JPEG image(s).")
+    print(f"  EXIF capture timestamps available: {timestamped}/{len(images)}")
+
+    _notify_progress(args, 0, 0, log_path.name, "Reading PX4 camera captures…")
+    print("STEP 2/5 — Read PX4 camera_capture records")
+    captures = load_captures(log_path)
+    confirmed = sum(capture.result == 1 for capture in captures)
+    no_feedback_total = sum(capture.result == -1 for capture in captures)
+    print(f"  Loaded {len(captures)} valid capture record(s).")
+    print(f"  Hardware-confirmed exposures: {confirmed}")
+    print(f"  Records without exposure feedback: {no_feedback_total}")
+
+    _notify_progress(args, 0, 0, f"{len(images)} images / {len(captures)} captures", "Matching images to trigger events…")
+    print("STEP 3/5 — Match each image to one PX4 trigger event")
+    matches, clock_offset = match_images(images, captures, args.match, args.tolerance)
+    print(f"  Matched {len(matches)}/{len(images)} images.")
+    if clock_offset is not None:
+        print(f"  Estimated camera-clock offset: {clock_offset:.6f} s")
+    else:
+        print("  Matching used capture order; no camera-clock offset was needed.")
+    if len(matches) != len(images):
+        raise TaggerError(f"Matched {len(matches)} of {len(images)} images; no files were written")
+    no_feedback = sum(match.capture.result == -1 for match in matches)
+    if no_feedback:
+        print(
+            f"WARNING: {no_feedback} capture records report no hardware exposure feedback. "
+            "Their position and attitude may correspond to the trigger command rather than "
+            "the actual exposure instant.",
+            file=sys.stderr,
+        )
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    report_rows = []
+    print()
+    print("STEP 4/5 — Copy images, write EXIF/XMP metadata, and verify")
+    for number, match in enumerate(matches, 1):
+        total = len(matches)
+        image_name = match.image.path.name
+        _notify_progress(args, number, total, image_name, "Copying and tagging image…")
+        print(f"[{number:04d}/{total:04d}] {image_name}")
+        print(f"  Capture sequence: {match.capture.sequence} (result {match.capture.result})")
+        if match.time_error_s is None:
+            print("  Match error: order matched")
+        else:
+            print(f"  Match error: {match.time_error_s:.6f} s")
+        print(
+            "  GPS to write: "
+            f"{match.capture.latitude:.9f}, {match.capture.longitude:.9f}, "
+            f"{match.capture.altitude_m:.3f} m AMSL"
+        )
+        print("  Copying source JPEG bytes into memory…")
+        source = match.image.path.read_bytes()
+        ypr = pix4d_ypr(
+            match.capture.quaternion_wxyz,
+            args.mount_roll,
+            args.mount_pitch,
+            args.mount_yaw,
+        )
+        print(f"  Pix4D orientation: yaw {ypr[0]:.6f}°, pitch {ypr[1]:.6f}°, roll {ypr[2]:.6f}°")
+        print("  Writing EXIF GPS and Pix4D XMP orientation blocks…")
+        tagged = write_metadata(source, match.capture, ypr)
+        print("  Verifying GPS, orientation, and unchanged JPEG scan data…")
+        verify_output(source, tagged, match.capture, ypr)
+        destination = output_dir / match.image.path.name
+        fd, temporary = tempfile.mkstemp(prefix=f".{destination.name}.", dir=output_dir)
+        try:
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(tagged)
+                stream.flush()
+                os.fsync(stream.fileno())
+            if destination.exists() and not args.overwrite:
+                raise TaggerError(f"Output file already exists: {destination}")
+            os.replace(temporary, destination)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+        shutil.copystat(match.image.path, destination)
+        report_rows.append(
+            {
+                "image": match.image.path.name,
+                "capture_sequence": match.capture.sequence,
+                "capture_result": match.capture.result,
+                "latitude": f"{match.capture.latitude:.9f}",
+                "longitude": f"{match.capture.longitude:.9f}",
+                "altitude_m_amsl": f"{match.capture.altitude_m:.3f}",
+                "pix4d_yaw_deg": f"{ypr[0]:.6f}",
+                "pix4d_pitch_deg": f"{ypr[1]:.6f}",
+                "pix4d_roll_deg": f"{ypr[2]:.6f}",
+                "match_error_s": "" if match.time_error_s is None else f"{match.time_error_s:.6f}",
+                "scan_sha256": hashlib.sha256(jpeg_scan_bytes(tagged)).hexdigest(),
+            }
+        )
+        print(f"  VERIFIED AND SAVED: {destination}")
+        _notify_progress(args, number, total, image_name, "Verified and saved image")
+
+    print()
+    print("STEP 5/5 — Write audit report")
+    report_path = output_dir / "tagging_report.csv"
+    with report_path.open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.DictWriter(stream, fieldnames=list(report_rows[0]))
+        writer.writeheader()
+        writer.writerows(report_rows)
+    print(f"  Report saved: {report_path}")
+    print()
+    print("=== COMPLETE — ALL OUTPUT IMAGES VERIFIED ===")
+    print(f"Wrote and verified {len(matches)} tagged JPEG copies in {output_dir}")
+    print("Original source JPEGs were not modified.")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Write PX4 GPS and rigid-camera attitude into Pix4D-ready JPEG copies."
+    )
+    parser.add_argument("log", type=Path, help="PX4 .ulg flight log")
+    parser.add_argument("images", type=Path, help="Folder containing original Sony JPEGs")
+    parser.add_argument("output", type=Path, help="Empty output folder for tagged copies")
+    parser.add_argument("--match", choices=("auto", "time", "order"), default="auto")
+    parser.add_argument("--tolerance", type=float, default=2.0, help="Timestamp tolerance in seconds")
+    parser.add_argument("--mount-roll", type=float, default=0.0, help="Camera mount roll offset, degrees")
+    parser.add_argument("--mount-pitch", type=float, default=0.0, help="Camera mount pitch offset, degrees")
+    parser.add_argument("--mount-yaw", type=float, default=0.0, help="Camera mount yaw offset, degrees")
+    parser.add_argument("--overwrite", action="store_true", help="Replace same-named files in output")
+    return parser
+
+
+def main(argv: Iterable[str] | None = None) -> int:
+    try:
+        return process(build_parser().parse_args(argv))
+    except TaggerError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
