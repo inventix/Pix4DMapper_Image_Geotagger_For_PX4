@@ -33,6 +33,11 @@ XMP_HEADER = b"http://ns.adobe.com/xap/1.0/\x00"
 XMP_NS = "adobe:ns:meta/"
 RDF_NS = "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
 CAMERA_NS = "http://pix4d.com/camera/1.0"
+JPEG_EXTENSIONS = {".jpg", ".jpeg", ".jpe"}
+RAW_IMAGE_EXTENSIONS = {
+    ".arw", ".cr2", ".cr3", ".dng", ".nef", ".nrw", ".orf", ".pef", ".raf", ".raw", ".rw2"
+}
+OTHER_IMAGE_EXTENSIONS = {".bmp", ".gif", ".heic", ".heif", ".png", ".tif", ".tiff", ".webp"}
 
 # Columns are Pix4D image axes expressed in the PX4 FRD body frame:
 # image right -> body right, image top -> body forward, camera back -> body up.
@@ -42,6 +47,10 @@ PIX4D_DEFAULT_BODY_FROM_IMAGE = np.array(
 
 
 class TaggerError(RuntimeError):
+    pass
+
+
+class TaggerCancelled(TaggerError):
     pass
 
 
@@ -62,6 +71,20 @@ class Capture:
 class ImageRecord:
     path: Path
     time_s: float | None
+    relative_path: Path | None = None
+
+
+@dataclass(frozen=True)
+class ImageInventory:
+    jpeg_paths: tuple[Path, ...]
+    raw_paths: tuple[Path, ...]
+    other_image_paths: tuple[Path, ...]
+    ignored_file_count: int
+    total_jpeg_bytes: int
+
+    @property
+    def nested_jpeg_count(self) -> int:
+        return sum(len(path.parts) > 1 for path in self.jpeg_paths)
 
 
 @dataclass(frozen=True)
@@ -148,6 +171,9 @@ def load_captures(log_path: Path, attitude_source: str = "body") -> list[Capture
         body_quaternions = np.concatenate(quaternion_parts)
 
     captures: list[Capture] = []
+    failed_capture_count = 0
+    invalid_record_count = 0
+    unbracketed_attitude_count = 0
     raw_index = 0
     for dataset in datasets:
         d = dataset.data
@@ -172,6 +198,7 @@ def load_captures(log_path: Path, attitude_source: str = "body") -> list[Capture
         for i in range(count):
             # PX4: 0 explicitly means capture failed; -1 means no feedback.
             if int(result[i]) == 0:
+                failed_capture_count += 1
                 raw_index += 1
                 continue
             la, lo, al = float(lat[i]), float(lon[i]), float(alt[i])
@@ -180,6 +207,7 @@ def load_captures(log_path: Path, attitude_source: str = "body") -> list[Capture
                 try:
                     q = interpolate_body_quaternion(body_times, body_quaternions, float(timestamp[i]))
                 except TaggerError:
+                    unbracketed_attitude_count += 1
                     raw_index += 1
                     continue
             else:
@@ -193,6 +221,7 @@ def load_captures(log_path: Path, attitude_source: str = "body") -> list[Capture
                 and all(math.isfinite(v) for v in q)
                 and np.linalg.norm(q) > 0.5
             ):
+                invalid_record_count += 1
                 raw_index += 1
                 continue
             utc = float(timestamp_utc[i])
@@ -215,7 +244,20 @@ def load_captures(log_path: Path, attitude_source: str = "body") -> list[Capture
 
     captures.sort(key=lambda c: (c.time_s, c.sequence, c.index))
     if not captures:
-        raise TaggerError("The camera_capture topic contains no valid capture records.")
+        details = []
+        if failed_capture_count:
+            details.append(f"{failed_capture_count} explicitly failed capture(s)")
+        if unbracketed_attitude_count:
+            details.append(
+                f"{unbracketed_attitude_count} capture(s) without nearby vehicle_attitude samples"
+            )
+        if invalid_record_count:
+            details.append(f"{invalid_record_count} record(s) with invalid GPS or quaternion data")
+        reason = f" ({'; '.join(details)})" if details else ""
+        raise TaggerError(
+            "The camera_capture topic contains no usable capture records"
+            f"{reason}. Check capture feedback, GPS validity, and the selected attitude source."
+        )
     return captures
 
 
@@ -249,23 +291,66 @@ def _parse_exif_datetime(exif: Image.Exif) -> float | None:
     return None
 
 
-def load_images(image_dir: Path) -> list[ImageRecord]:
-    extensions = {".jpg", ".jpeg"}
-    paths = sorted(
-        (p for p in image_dir.iterdir() if p.is_file() and p.suffix.lower() in extensions),
-        key=lambda p: p.name.lower(),
+def inventory_images(image_dir: Path, recursive: bool = False) -> ImageInventory:
+    """Classify source-folder files without trusting their names as JPEG proof."""
+    if not image_dir.is_dir():
+        raise TaggerError(f"Image folder not found: {image_dir}")
+    candidates = image_dir.rglob("*") if recursive else image_dir.iterdir()
+    jpeg_paths, raw_paths, other_paths = [], [], []
+    ignored = 0
+    for path in candidates:
+        if not path.is_file() or path.is_symlink():
+            continue
+        suffix = path.suffix.lower()
+        relative = path.relative_to(image_dir)
+        if suffix in JPEG_EXTENSIONS:
+            jpeg_paths.append(relative)
+        elif suffix in RAW_IMAGE_EXTENSIONS:
+            raw_paths.append(relative)
+        elif suffix in OTHER_IMAGE_EXTENSIONS:
+            other_paths.append(relative)
+        else:
+            ignored += 1
+    key = lambda path: str(path).casefold()
+    jpeg_paths.sort(key=key)
+    raw_paths.sort(key=key)
+    other_paths.sort(key=key)
+    total_bytes = sum((image_dir / path).stat().st_size for path in jpeg_paths)
+    return ImageInventory(
+        tuple(jpeg_paths), tuple(raw_paths), tuple(other_paths), ignored, total_bytes
     )
-    if not paths:
-        raise TaggerError(f"No JPEG images found in {image_dir}")
+
+
+def load_images(image_dir: Path, recursive: bool = False) -> list[ImageRecord]:
+    inventory = inventory_images(image_dir, recursive=recursive)
+    if not inventory.jpeg_paths:
+        details = []
+        if inventory.raw_paths:
+            details.append(f"{len(inventory.raw_paths)} camera RAW file(s)")
+        if inventory.other_image_paths:
+            details.append(f"{len(inventory.other_image_paths)} other image file(s)")
+        suffix = f"; found {' and '.join(details)}. Convert/export them to JPEG first" if details else ""
+        raise TaggerError(f"No supported JPEG images found in {image_dir}{suffix}")
     records: list[ImageRecord] = []
-    for path in paths:
+    for relative_path in inventory.jpeg_paths:
+        path = image_dir / relative_path
         try:
             with Image.open(path) as image:
                 if image.format != "JPEG":
-                    continue
-                records.append(ImageRecord(path=path, time_s=_parse_exif_datetime(image.getexif())))
+                    raise TaggerError(
+                        f"{relative_path} has a JPEG filename extension but is actually {image.format or 'unknown data'}"
+                    )
+                records.append(
+                    ImageRecord(
+                        path=path,
+                        time_s=_parse_exif_datetime(image.getexif()),
+                        relative_path=relative_path,
+                    )
+                )
         except Exception as exc:
-            raise TaggerError(f"Cannot read JPEG metadata from {path.name}: {exc}") from exc
+            if isinstance(exc, TaggerError):
+                raise
+            raise TaggerError(f"Cannot read JPEG metadata from {relative_path}: {exc}") from exc
     return records
 
 
@@ -350,6 +435,10 @@ def match_images(
     method: str,
     tolerance_s: float,
 ) -> tuple[list[Match], float | None]:
+    if method not in {"auto", "time", "order"}:
+        raise TaggerError(f"Unknown matching method: {method}")
+    if not math.isfinite(float(tolerance_s)) or tolerance_s < 0:
+        raise TaggerError("Timestamp tolerance must be a finite, non-negative number")
     if method == "order":
         return match_by_order(images, captures), None
     if method == "time":
@@ -669,6 +758,85 @@ def _notify_progress(
         callback(current, total, image_name, stage)
 
 
+def save_conversion_log(
+    output_dir: Path,
+    lines: Sequence[str],
+    app_version: str,
+    result: str,
+    created_at: datetime | None = None,
+) -> Path:
+    """Atomically save a unique, human-readable conversion session log."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = created_at or datetime.now()
+    stem = f"conversion_log_{timestamp:%Y%m%d_%H%M%S}"
+    destination = output_dir / f"{stem}.txt"
+    counter = 2
+    while destination.exists():
+        destination = output_dir / f"{stem}_{counter}.txt"
+        counter += 1
+    body = "\n".join(
+        [
+            "PX4 → Pix4D JPEG Tagger — Conversion Log",
+            f"Software version: {app_version}",
+            f"Session started: {timestamp.astimezone().isoformat(timespec='seconds')}",
+            f"Final result: {result}",
+            "",
+            *[str(line).rstrip("\n") for line in lines],
+            "",
+        ]
+    )
+    fd, temporary = tempfile.mkstemp(prefix=f".{destination.name}.", dir=output_dir)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as stream:
+            stream.write(body)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, destination)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+    return destination
+
+
+def _check_cancelled(args: argparse.Namespace) -> None:
+    event = getattr(args, "cancel_event", None)
+    if event is not None and event.is_set():
+        raise TaggerCancelled("Processing was cancelled. No staged images were published.")
+
+
+def _existing_parent(path: Path) -> Path:
+    candidate = path.resolve()
+    while not candidate.exists() and candidate != candidate.parent:
+        candidate = candidate.parent
+    return candidate
+
+
+def verify_output_capacity(output_dir: Path, required_bytes: int) -> None:
+    parent = _existing_parent(output_dir.parent)
+    try:
+        free = shutil.disk_usage(parent).free
+    except OSError as exc:
+        raise TaggerError(f"Could not check free disk space near {output_dir}: {exc}") from exc
+    if free < required_bytes:
+        raise TaggerError(
+            f"Not enough free disk space. Need about {required_bytes / 1_048_576:.0f} MB, "
+            f"but only {free / 1_048_576:.0f} MB is available near {output_dir}."
+        )
+
+
+def _directory_bytes(path: Path) -> int:
+    if not path.is_dir():
+        return 0
+    total = 0
+    try:
+        for item in path.rglob("*"):
+            if item.is_file() and not item.is_symlink():
+                total += item.stat().st_size
+    except OSError as exc:
+        raise TaggerError(f"Could not inventory existing output folder {path}: {exc}") from exc
+    return total
+
+
 def process(args: argparse.Namespace) -> int:
     log_path = args.log.resolve()
     image_dir = args.images.resolve()
@@ -679,14 +847,32 @@ def process(args: argparse.Namespace) -> int:
         raise TaggerError(f"Image directory not found: {image_dir}")
     if output_dir == image_dir or image_dir in output_dir.parents:
         raise TaggerError("Output directory must not be the source image directory or inside it")
-    if output_dir.exists() and any(output_dir.iterdir()) and not args.overwrite:
+    if output_dir.exists() and not output_dir.is_dir():
+        raise TaggerError(f"Output path is not a folder: {output_dir}")
+    overwrite = bool(getattr(args, "overwrite", False))
+    if output_dir.exists() and any(output_dir.iterdir()) and not overwrite:
         raise TaggerError("Output directory is not empty; use --overwrite or select an empty folder")
+    match_method = str(getattr(args, "match", "auto"))
+    tolerance = float(getattr(args, "tolerance", 2.0))
+    if match_method not in {"auto", "time", "order"}:
+        raise TaggerError(f"Unknown matching method: {match_method}")
+    if not math.isfinite(tolerance) or tolerance < 0:
+        raise TaggerError("Timestamp tolerance must be a finite, non-negative number")
+    _check_cancelled(args)
+    recursive = bool(getattr(args, "recursive", False))
+    inventory = inventory_images(image_dir, recursive=recursive)
+    existing_output_bytes = _directory_bytes(output_dir) if overwrite else 0
+    required_bytes = max(
+        int(inventory.total_jpeg_bytes * 1.25) + existing_output_bytes + 10 * 1_048_576,
+        20 * 1_048_576,
+    )
+    verify_output_capacity(output_dir, required_bytes)
 
     print("=== PX4 → Pix4D IMAGE-TAGGING SESSION ===")
     print(f"Flight log:       {log_path}")
     print(f"Original JPEGs:   {image_dir}")
     print(f"Tagged output:    {output_dir}")
-    print(f"Match method:     {args.match} (tolerance {args.tolerance:.3f} s)")
+    print(f"Match method:     {match_method} (tolerance {tolerance:.3f} s)")
     attitude_source = getattr(args, "attitude_source", "body")
     print(f"Attitude source:  {'PX4 vehicle_attitude (aircraft body)' if attitude_source == 'body' else 'camera_capture.q (camera/gimbal)'}")
     camera_facing = getattr(args, "camera_facing", 0.0)
@@ -697,15 +883,33 @@ def process(args: argparse.Namespace) -> int:
         f"faces {camera_facing:.3f}° clockwise from nose, "
         f"{camera_down_angle:.3f}° down, image rotation {image_rotation:.3f}°"
     )
-    print(f"Existing outputs: {'replace when names match' if args.overwrite else 'must be empty'}")
+    print(f"Existing outputs: {'replace when names match' if overwrite else 'must be empty'}")
+    print(f"Search subfolders: {'yes' if recursive else 'no'}")
+    print(f"Source JPEG data: {inventory.total_jpeg_bytes / 1_048_576:.1f} MB")
+    print(
+        "Input inventory:  "
+        f"{len(inventory.jpeg_paths)} JPEG, {len(inventory.raw_paths)} RAW, "
+        f"{len(inventory.other_image_paths)} other image, {inventory.ignored_file_count} other file(s)"
+    )
+    if inventory.raw_paths:
+        print(
+            f"WARNING: Ignoring {len(inventory.raw_paths)} camera RAW file(s); export them to JPEG before tagging.",
+            file=sys.stderr,
+        )
+    if inventory.other_image_paths:
+        print(
+            f"WARNING: Ignoring {len(inventory.other_image_paths)} unsupported image file(s).",
+            file=sys.stderr,
+        )
     print()
 
     _notify_progress(args, 0, 0, image_dir.name, "Discovering source JPEGs…")
     print("STEP 1/5 — Discover source JPEGs")
-    images = load_images(image_dir)
+    images = load_images(image_dir, recursive=recursive)
     timestamped = sum(image.time_s is not None for image in images)
     print(f"  Found {len(images)} JPEG image(s).")
     print(f"  EXIF capture timestamps available: {timestamped}/{len(images)}")
+    _check_cancelled(args)
 
     _notify_progress(args, 0, 0, log_path.name, "Reading PX4 camera captures…")
     print("STEP 2/5 — Read PX4 camera_capture records")
@@ -715,10 +919,11 @@ def process(args: argparse.Namespace) -> int:
     print(f"  Loaded {len(captures)} valid capture record(s).")
     print(f"  Hardware-confirmed exposures: {confirmed}")
     print(f"  Records without exposure feedback: {no_feedback_total}")
+    _check_cancelled(args)
 
     _notify_progress(args, 0, 0, f"{len(images)} images / {len(captures)} captures", "Matching images to trigger events…")
     print("STEP 3/5 — Match each image to one PX4 trigger event")
-    matches, clock_offset = match_images(images, captures, args.match, args.tolerance)
+    matches, clock_offset = match_images(images, captures, match_method, tolerance)
     print(f"  Matched {len(matches)}/{len(images)} images.")
     if clock_offset is not None:
         print(f"  Estimated camera-clock offset: {clock_offset:.6f} s")
@@ -735,81 +940,134 @@ def process(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
 
-    output_dir.mkdir(parents=True, exist_ok=True)
     report_rows = []
+    try:
+        output_dir.parent.mkdir(parents=True, exist_ok=True)
+        stage_dir = Path(
+            tempfile.mkdtemp(prefix=f".{output_dir.name}.staging-", dir=output_dir.parent)
+        )
+        if output_dir.exists():
+            print("  Preparing a recoverable copy of the existing output folder…")
+            shutil.copytree(output_dir, stage_dir, dirs_exist_ok=True, symlinks=True)
+    except OSError as exc:
+        if "stage_dir" in locals() and stage_dir.exists():
+            shutil.rmtree(stage_dir, ignore_errors=True)
+        raise TaggerError(
+            f"Cannot create a temporary staging folder near {output_dir}. "
+            f"Check folder permissions and available disk space: {exc}"
+        ) from exc
     print()
-    print("STEP 4/5 — Copy images, write EXIF/XMP metadata, and verify")
-    for number, match in enumerate(matches, 1):
-        total = len(matches)
-        image_name = match.image.path.name
-        _notify_progress(args, number, total, image_name, "Copying and tagging image…")
-        print(f"[{number:04d}/{total:04d}] {image_name}")
-        print(f"  Capture sequence: {match.capture.sequence} (result {match.capture.result})")
-        if match.time_error_s is None:
-            print("  Match error: order matched")
-        else:
-            print(f"  Match error: {match.time_error_s:.6f} s")
-        print(
-            "  GPS to write: "
-            f"{match.capture.latitude:.9f}, {match.capture.longitude:.9f}, "
-            f"{match.capture.altitude_m:.3f} m AMSL"
-        )
-        print("  Copying source JPEG bytes into memory…")
-        source = match.image.path.read_bytes()
-        ypr = pix4d_ypr(
-            match.capture.quaternion_wxyz,
-            camera_facing_deg=camera_facing,
-            camera_down_angle_deg=camera_down_angle,
-            image_rotation_deg=image_rotation,
-        )
-        print(f"  Pix4D orientation: yaw {ypr[0]:.6f}°, pitch {ypr[1]:.6f}°, roll {ypr[2]:.6f}°")
-        print("  Writing EXIF GPS and Pix4D XMP orientation blocks…")
-        tagged = write_metadata(source, match.capture, ypr)
-        print("  Verifying GPS, orientation, and unchanged JPEG scan data…")
-        verify_output(source, tagged, match.capture, ypr)
-        destination = output_dir / match.image.path.name
-        fd, temporary = tempfile.mkstemp(prefix=f".{destination.name}.", dir=output_dir)
-        try:
-            with os.fdopen(fd, "wb") as stream:
-                stream.write(tagged)
-                stream.flush()
-                os.fsync(stream.fileno())
-            if destination.exists() and not args.overwrite:
-                raise TaggerError(f"Output file already exists: {destination}")
-            os.replace(temporary, destination)
-        finally:
-            if os.path.exists(temporary):
-                os.unlink(temporary)
-        shutil.copystat(match.image.path, destination)
-        report_rows.append(
-            {
-                "image": match.image.path.name,
-                "capture_sequence": match.capture.sequence,
-                "capture_result": match.capture.result,
-                "latitude": f"{match.capture.latitude:.9f}",
-                "longitude": f"{match.capture.longitude:.9f}",
-                "altitude_m_amsl": f"{match.capture.altitude_m:.3f}",
-                "pix4d_yaw_deg": f"{ypr[0]:.6f}",
-                "pix4d_pitch_deg": f"{ypr[1]:.6f}",
-                "pix4d_roll_deg": f"{ypr[2]:.6f}",
-                "camera_facing_deg_from_nose": f"{camera_facing:.6f}",
-                "camera_down_angle_deg": f"{camera_down_angle:.6f}",
-                "image_rotation_deg_clockwise": f"{image_rotation:.6f}",
-                "match_error_s": "" if match.time_error_s is None else f"{match.time_error_s:.6f}",
-                "scan_sha256": hashlib.sha256(jpeg_scan_bytes(tagged)).hexdigest(),
-            }
-        )
-        print(f"  VERIFIED AND SAVED: {destination}")
-        _notify_progress(args, number, total, image_name, "Verified and saved image")
+    try:
+        print("STEP 4/5 — Stage images, write EXIF/XMP metadata, and verify")
+        for number, match in enumerate(matches, 1):
+            _check_cancelled(args)
+            total = len(matches)
+            relative_path = match.image.relative_path or Path(match.image.path.name)
+            # Use forward slashes in logs/reports on every platform so audit
+            # files compare cleanly between Windows and POSIX systems.
+            image_name = relative_path.as_posix()
+            _notify_progress(args, number, total, image_name, "Copying and tagging image…")
+            print(f"[{number:04d}/{total:04d}] {image_name}")
+            print(f"  Capture sequence: {match.capture.sequence} (result {match.capture.result})")
+            if match.time_error_s is None:
+                print("  Match error: order matched")
+            else:
+                print(f"  Match error: {match.time_error_s:.6f} s")
+            print(
+                "  GPS to write: "
+                f"{match.capture.latitude:.9f}, {match.capture.longitude:.9f}, "
+                f"{match.capture.altitude_m:.3f} m AMSL"
+            )
+            print("  Copying source JPEG bytes into memory…")
+            try:
+                source = match.image.path.read_bytes()
+            except OSError as exc:
+                raise TaggerError(f"Cannot read source JPEG {relative_path}: {exc}") from exc
+            ypr = pix4d_ypr(
+                match.capture.quaternion_wxyz,
+                camera_facing_deg=camera_facing,
+                camera_down_angle_deg=camera_down_angle,
+                image_rotation_deg=image_rotation,
+            )
+            print(f"  Pix4D orientation: yaw {ypr[0]:.6f}°, pitch {ypr[1]:.6f}°, roll {ypr[2]:.6f}°")
+            print("  Writing EXIF GPS and Pix4D XMP orientation blocks…")
+            tagged = write_metadata(source, match.capture, ypr)
+            print("  Verifying GPS, orientation, and unchanged JPEG scan data…")
+            verify_output(source, tagged, match.capture, ypr)
+            destination = stage_dir / relative_path
+            try:
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_bytes(tagged)
+                shutil.copystat(match.image.path, destination)
+            except OSError as exc:
+                raise TaggerError(f"Cannot stage tagged JPEG {relative_path}: {exc}") from exc
+            source_sha256 = hashlib.sha256(source).hexdigest()
+            report_rows.append(
+                {
+                    "image": relative_path.as_posix(),
+                    "source_bytes": len(source),
+                    "source_sha256": source_sha256,
+                    "capture_sequence": match.capture.sequence,
+                    "capture_result": match.capture.result,
+                    "attitude_source": attitude_source,
+                    "match_method": match_method,
+                    "latitude": f"{match.capture.latitude:.9f}",
+                    "longitude": f"{match.capture.longitude:.9f}",
+                    "altitude_m_amsl": f"{match.capture.altitude_m:.3f}",
+                    "pix4d_yaw_deg": f"{ypr[0]:.6f}",
+                    "pix4d_pitch_deg": f"{ypr[1]:.6f}",
+                    "pix4d_roll_deg": f"{ypr[2]:.6f}",
+                    "camera_facing_deg_from_nose": f"{camera_facing:.6f}",
+                    "camera_down_angle_deg": f"{camera_down_angle:.6f}",
+                    "image_rotation_deg_clockwise": f"{image_rotation:.6f}",
+                    "match_error_s": "" if match.time_error_s is None else f"{match.time_error_s:.6f}",
+                    "scan_sha256": hashlib.sha256(jpeg_scan_bytes(tagged)).hexdigest(),
+                }
+            )
+            print(f"  VERIFIED IN STAGING: {relative_path}")
+            _notify_progress(args, number, total, image_name, "Verified and staged image")
 
-    print()
-    print("STEP 5/5 — Write audit report")
-    report_path = output_dir / "tagging_report.csv"
-    with report_path.open("w", newline="", encoding="utf-8") as stream:
-        writer = csv.DictWriter(stream, fieldnames=list(report_rows[0]))
-        writer.writeheader()
-        writer.writerows(report_rows)
-    print(f"  Report saved: {report_path}")
+        _check_cancelled(args)
+        print()
+        print("STEP 5/5 — Write audit report and publish complete output set")
+        staged_report = stage_dir / "tagging_report.csv"
+        with staged_report.open("w", newline="", encoding="utf-8") as stream:
+            writer = csv.DictWriter(stream, fieldnames=list(report_rows[0]))
+            writer.writeheader()
+            writer.writerows(report_rows)
+        output_was_absent = not output_dir.exists()
+        try:
+            if output_was_absent:
+                os.replace(stage_dir, output_dir)
+            else:
+                backup_dir = Path(
+                    tempfile.mkdtemp(prefix=f".{output_dir.name}.previous-", dir=output_dir.parent)
+                )
+                backup_dir.rmdir()
+                os.replace(output_dir, backup_dir)
+                try:
+                    os.replace(stage_dir, output_dir)
+                except OSError:
+                    os.replace(backup_dir, output_dir)
+                    raise
+                try:
+                    shutil.rmtree(backup_dir)
+                except OSError as cleanup_error:
+                    print(
+                        f"WARNING: New outputs were published, but the previous-output backup "
+                        f"could not be removed: {backup_dir} ({cleanup_error})",
+                        file=sys.stderr,
+                    )
+        except OSError as exc:
+            raise TaggerError(
+                f"All images were verified in staging, but the completed output set could not be "
+                f"published to {output_dir}: {exc}"
+            ) from exc
+        report_path = output_dir / "tagging_report.csv"
+        print(f"  Report saved: {report_path}")
+    finally:
+        if stage_dir.exists():
+            shutil.rmtree(stage_dir, ignore_errors=True)
     print()
     print("=== COMPLETE — ALL OUTPUT IMAGES VERIFIED ===")
     print(f"Wrote and verified {len(matches)} tagged JPEG copies in {output_dir}")
@@ -822,7 +1080,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="Write PX4 GPS and rigid-camera attitude into Pix4D-ready JPEG copies."
     )
     parser.add_argument("log", type=Path, help="PX4 .ulg flight log")
-    parser.add_argument("images", type=Path, help="Folder containing original Sony JPEGs")
+    parser.add_argument("images", type=Path, help="Folder containing original camera JPEGs")
     parser.add_argument("output", type=Path, help="Empty output folder for tagged copies")
     parser.add_argument("--match", choices=("auto", "time", "order"), default="auto")
     parser.add_argument(
@@ -854,6 +1112,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Physical image rotation clockwise from landscape, degrees",
     )
     parser.add_argument("--overwrite", action="store_true", help="Replace same-named files in output")
+    parser.add_argument(
+        "--recursive",
+        action="store_true",
+        help="Include JPEGs in subfolders and preserve their relative folder structure",
+    )
     return parser
 
 
